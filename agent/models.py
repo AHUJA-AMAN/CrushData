@@ -11,6 +11,8 @@ class Stage(str, Enum):
 
 
 class FounderProfile(BaseModel):
+    model_config = {"extra": "ignore"}
+
     domain_expertise: Optional[List[str]] = None
     previous_startup: Optional[bool] = None
     serial_founder: Optional[bool] = None
@@ -23,21 +25,27 @@ class FounderProfile(BaseModel):
     previous_company: Optional[str] = None
     previous_role: Optional[str] = None
     years_of_experience: Optional[str] = None
+    years_experience: Optional[str] = None        # frontend alias
     nationality: Optional[str] = None
     current_location: Optional[str] = None
     age_range: Optional[str] = None
     accelerator_alumni: Optional[List[str]] = None
     notable_employer: Optional[str] = None
+    notable_employer_alumni: Optional[str] = None  # frontend alias
     solo_or_cofounded: Optional[str] = None
+    solo_vs_cofounded: Optional[str] = None        # frontend alias
+    research_publications: Optional[bool] = None   # frontend sends this
     team_size: Optional[str] = None
 
 
 class Thesis(BaseModel):
     sector: str
     geography: str
-    stage: Optional[Stage] = Stage.any
-    founder_keyword: Optional[str] = None  # simple mode free-text, e.g. "prior infra experience"
+    stage: Optional[str] = "any"           # accept any string, comma-separated ok
+    founder_keyword: Optional[str] = None
     founder_profile: Optional[FounderProfile] = None
+
+    model_config = {"extra": "ignore"}     # ignore unknown fields from frontend
 
 
 class Confidence(str, Enum):

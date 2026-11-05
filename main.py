@@ -6,6 +6,9 @@ from pydantic import BaseModel
 from typing import Optional
 from dotenv import load_dotenv
 from agent.models import Thesis
+
+class RunRequest(BaseModel):
+    thesis: Thesis
 from agent.orchestrator import run_pipeline, run_backtest_pipeline
 
 load_dotenv()
@@ -33,7 +36,7 @@ jobs: dict = {}
 
 
 @app.post("/run")
-async def run(thesis: Thesis, background_tasks: BackgroundTasks):
+async def run(request: RunRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())[:8]
     jobs[job_id] = {
         "status": "running",
@@ -44,7 +47,7 @@ async def run(thesis: Thesis, background_tasks: BackgroundTasks):
         },
         "results": None
     }
-    background_tasks.add_task(run_pipeline, thesis.model_dump(), job_id, jobs)
+    background_tasks.add_task(run_pipeline, request.thesis.model_dump(), job_id, jobs)
     return {"job_id": job_id}
 
 
