@@ -1,11 +1,11 @@
 // The ONLY place the frontend talks to the backend.
-// To go live: set VITE_USE_MOCK=false in frontend/.env.local (or replace a function body).
-// Endpoint paths below are guesses until the agent owner shares the real contract.
-import { mockEmails, mockExceptions, mockMemos, mockRun } from "./mock";
-import type { ExceptionItem, Memo, OutreachEmail, PipelineRun } from "./types";
+// Mock mode is on by default. To use the real backend, set VITE_USE_MOCK=false in frontend/.env.local
+// (see .env.example). Each function has a mock branch and a real branch, so swapping is one line.
+import { mockResults, mockStatus, registerMockJob } from "./mock";
+import type { JobResults, JobStatus, RunRequest, RunResponse } from "./types";
 
 const USE_MOCK = import.meta.env.VITE_USE_MOCK !== "false";
-const BASE = import.meta.env.VITE_API_BASE ?? "/api";
+const BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 
 const delay = <T,>(value: T, ms = 300) => new Promise<T>((r) => setTimeout(() => r(value), ms));
 
@@ -18,24 +18,22 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-export function startRun(thesis: string): Promise<{ runId: string }> {
-  return USE_MOCK
-    ? delay({ runId: mockRun.runId })
-    : http("/runs", { method: "POST", body: JSON.stringify({ thesis }) });
+// POST /run
+export function startRun(req: RunRequest): Promise<RunResponse> {
+  if (USE_MOCK) {
+    const job_id = `mock_${Math.random().toString(36).slice(2, 8)}`;
+    registerMockJob(job_id);
+    return delay({ job_id });
+  }
+  return http("/run", { method: "POST", body: JSON.stringify(req) });
 }
 
-export function getRun(runId: string): Promise<PipelineRun> {
-  return USE_MOCK ? delay(mockRun) : http(`/runs/${runId}`);
+// GET /status/{job_id}
+export function getStatus(jobId: string): Promise<JobStatus> {
+  return USE_MOCK ? delay(mockStatus(jobId), 150) : http(`/status/${jobId}`);
 }
 
-export function getMemos(runId: string): Promise<Memo[]> {
-  return USE_MOCK ? delay(mockMemos) : http(`/runs/${runId}/memos`);
-}
-
-export function getExceptions(runId: string): Promise<ExceptionItem[]> {
-  return USE_MOCK ? delay(mockExceptions) : http(`/runs/${runId}/exceptions`);
-}
-
-export function getEmails(runId: string): Promise<OutreachEmail[]> {
-  return USE_MOCK ? delay(mockEmails) : http(`/runs/${runId}/emails`);
+// GET /results/{job_id}
+export function getResults(jobId: string): Promise<JobResults> {
+  return USE_MOCK ? delay({ ...mockResults, job_id: jobId }) : http(`/results/${jobId}`);
 }
