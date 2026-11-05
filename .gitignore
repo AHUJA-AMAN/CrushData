@@ -1,8 +1,14 @@
-node_modules/
-dist/
 .env
-.env.local
+.env.*
+!.env.example
+node_modules/
 __pycache__/
 *.pyc
 .venv/
+venv/
+dist/
+build/
+.next/
 .DS_Store
+*.log
+.cache/crustdata/private/
