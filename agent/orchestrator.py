@@ -135,37 +135,72 @@ def send_outreach_email(send_to: str, intended_for: str, subject: str, body: str
         return False
 
 
-# --- Build citations from data sources ---
+# --- Build citations from new founder_insights structure ---
 
-def build_citations(company_data: dict, founder_data: list, web_data: str) -> list[Citation]:
+def build_citations(company_data: dict, founder_insights_list: list, web_data: str) -> list[Citation]:
     citations = []
 
-    if company_data.get("headcount_history"):
+    if company_data.get("headcount"):
         citations.append(Citation(
-            claim="Headcount history",
+            claim="Headcount data",
             source="Crustdata company data",
             confidence=Confidence.verified
         ))
-    if company_data.get("funding_rounds"):
+    if company_data.get("total_funding"):
         citations.append(Citation(
             claim="Funding information",
             source="Crustdata company data",
             confidence=Confidence.verified
         ))
-    for f in founder_data:
-        if f.get("past_roles"):
+    for fi in founder_insights_list:
+        name = fi.get("name", "founder")
+        if fi.get("past_roles"):
             citations.append(Citation(
-                claim=f"Career history for {f.get('name', 'founder')}",
+                claim=f"Career history for {name}",
                 source="Crustdata people data",
+                confidence=Confidence.verified
+            ))
+        age = fi.get("age") or {}
+        if age.get("age_range"):
+            citations.append(Citation(
+                claim=f"Age estimate for {name}: {age.get('age_range')} (confidence: {age.get('confidence', 'low')})",
+                source="Crustdata education data — birth ≈ bachelor's start − 18",
+                confidence=Confidence.inferred
+            ))
+        investor = fi.get("investor_association") or {}
+        if investor.get("trust_level") and investor["trust_level"] != "none_found":
+            citations.append(Citation(
+                claim=f"Investor association for {name}: {investor['trust_level']}",
+                source="Crustdata investor data",
+                confidence=Confidence.verified
+            ))
+        exits = fi.get("exits") or []
+        for exit_ in exits:
+            citations.append(Citation(
+                claim=f"Exit: {exit_.get('company')} ({exit_.get('exit_status', 'unverified')})",
+                source="Crustdata exit data",
+                confidence=Confidence.verified if exit_.get("exit_status") == "verified" else Confidence.inferred
+            ))
+        github = fi.get("github") or {}
+        if github.get("has_github"):
+            citations.append(Citation(
+                claim=f"GitHub presence for {name}: {github.get('total_stars_bucket', 'unknown')} stars",
+                source="Crustdata GitHub data",
+                confidence=Confidence.verified
+            ))
+        research = fi.get("research") or {}
+        if research.get("has_publications"):
+            citations.append(Citation(
+                claim=f"Research publications for {name}: {research.get('article_count', '?')} articles, h-index {research.get('h_index', '?')}",
+                source="Crustdata research data",
                 confidence=Confidence.verified
             ))
     if web_data:
         citations.append(Citation(
-            claim="Market data and company description",
+            claim="Market data, product details, GitHub/paper details",
             source="Web search",
             confidence=Confidence.web
         ))
-
     return citations
 
 
@@ -173,31 +208,56 @@ def build_citations(company_data: dict, founder_data: list, web_data: str) -> li
 
 EXCEPTION_THRESHOLD = 3
 
-def count_unavailable(company_data: dict, founder_data: list) -> int:
+def count_unavailable(company_data: dict, founder_insights_list: list) -> int:
     missing = 0
     if not company_data.get("description"):
         missing += 1
-    if not company_data.get("funding_rounds"):
+    if not company_data.get("total_funding"):
         missing += 1
-    if not company_data.get("headcount_history"):
+    if not company_data.get("headcount"):
         missing += 1
-    if not founder_data:
+    if not founder_insights_list:
         missing += 1
-    elif not founder_data[0].get("past_roles"):
+    elif not founder_insights_list[0].get("past_roles"):
         missing += 1
     return missing
+
+
+# --- Build a text summary of founder insights for decision prompt ---
+
+def build_founder_summary(founder_insights_list: list) -> str:
+    parts = []
+    for fi in founder_insights_list:
+        name = fi.get("name", "Unknown")
+        title = fi.get("current_title", "")
+        age = fi.get("age") or {}
+        investor = fi.get("investor_association") or {}
+        technical = fi.get("technical") or {}
+        github = fi.get("github") or {}
+        research = fi.get("research") or {}
+        exits = fi.get("exits") or []
+
+        summary = f"{name} ({title})"
+        if age.get("age_range"):
+            summary += f", age ~{age['age_range']} [{age.get('confidence','low')} confidence]"
+        summary += f", technical={technical.get('is_technical')}"
+        summary += f", investor_trust={investor.get('trust_level', 'none_found')}"
+        summary += f", serial_founder={fi.get('serial_founder')}"
+        summary += f", previous_exit={'yes' if exits else 'none'}"
+        summary += f", github_stars={github.get('total_stars_bucket', 'none')}"
+        summary += f", publications={research.get('article_count', 'none')}"
+        summary += f", part_time_flag={fi.get('possible_part_time_founder', False)}"
+        parts.append(summary)
+    return " | ".join(parts) if parts else "No founder data available"
 
 
 # --- Main pipeline ---
 
 async def run_pipeline(thesis: dict, job_id: str, jobs: dict):
     try:
-        # Try importing Bhav's module — fall back to empty results if not ready
         try:
             from crustdata.client import (
-                search_companies, search_people,
-                get_company_details, get_person_details,
-                get_headcount_growth, get_job_postings,
+                search_founders, founder_insights,
                 watch_company, find_email, outreach_recipient
             )
             crustdata_ready = True
@@ -206,143 +266,142 @@ async def run_pipeline(thesis: dict, job_id: str, jobs: dict):
             find_email = None
             outreach_recipient = None
 
-        # Step 1: Parse thesis
+        # Step 1: Parse thesis into search_founders parameters
         jobs[job_id]["progress"]["stage"] = "discovery"
         filters = parse_thesis(thesis)
 
-        # Step 2: Discover companies
-        companies = []
+        # Step 2: Search founders
+        people = []
         if crustdata_ready:
-            companies = search_companies(
-                sector=filters.get("sector"),
-                geography=filters.get("geography"),
-                stage=thesis.get("stage"),
-                keywords=filters.get("keywords", []),
-                limit=10
+            people = search_founders(
+                country=filters.get("geography"),
+                schools=filters.get("schools", []),
+                fields_of_study=filters.get("fields_of_study", []),
+                past_companies=filters.get("past_companies", []),
+                past_titles=filters.get("past_titles", []),
+                expertise_keywords=filters.get("expertise_keywords", [])
             ) or []
 
-        jobs[job_id]["progress"]["companies_found"] = len(companies)
-
-        if not companies:
+        if not people:
             jobs[job_id]["status"] = "done"
             jobs[job_id]["results"] = []
             return
 
+        # Step 3: Get insights for all founders (10-15 credits per founder, cached after)
+        jobs[job_id]["progress"]["stage"] = "verification"
+        insights = {}
+        if crustdata_ready:
+            insights = founder_insights(people) or {}
+
+        # Step 4: Group founders by company
+        companies: dict = {}
+        for person_id, fi in insights.items():
+            company = fi.get("company") or {}
+            company_key = company.get("crustdata_company_id") or company.get("name") or person_id
+            if company_key not in companies:
+                companies[company_key] = {"company_data": company, "founders": []}
+            companies[company_key]["founders"].append(fi)
+
+        jobs[job_id]["progress"]["companies_found"] = len(companies)
+
         results = []
 
-        for i, company in enumerate(companies):
-            jobs[job_id]["progress"]["stage"] = "verification"
+        for i, (_, group) in enumerate(companies.items()):
             jobs[job_id]["progress"]["companies_processed"] = i
+            company_data = group["company_data"]
+            fi_list = group["founders"]
+            company_name = company_data.get("name") or "Unknown"
+            company_id = company_data.get("crustdata_company_id")
+            domain = company_data.get("website") or ""
 
-            company_id = company.get("crustdata_company_id") or company.get("id")
-            company_name = company.get("name", "Unknown")
-
-            # Step 3a: Enrich company
-            company_data = {}
-            if crustdata_ready and company_id:
-                company_data = get_company_details(company_id) or {}
-
-            # Step 3b: Find and enrich founders
-            founder_data = []
-            if crustdata_ready and company_id:
-                people = search_people(
-                    company_id=company_id,
-                    founder_only=True
-                ) or []
-                for person in people[:3]:  # cap at 3 founders
-                    person_id = person.get("crustdata_person_id") or person.get("id")
-                    if person_id:
-                        details = get_person_details(person_id) or {}
-                        founder_data.append(details)
-
-            # Step 3c: Signals
+            # Step 5: Extract signals from company data
             jobs[job_id]["progress"]["stage"] = "signal_analysis"
-            signals_raw = {}
-            if crustdata_ready and company_id:
-                headcount = get_headcount_growth(company_id, months=6) or {}
-                postings = get_job_postings(company_id) or []
-                signals_raw = {
-                    "headcount_now": headcount.get("current"),
-                    "headcount_6m_ago": headcount.get("six_months_ago"),
-                    "headcount_growth_rate": headcount.get("growth_rate"),
-                    "recent_job_postings": len(postings),
-                    "hiring_departments": list({p.get("department") for p in postings if p.get("department")})
-                }
+            signals_raw = {
+                "headcount_now": company_data.get("headcount"),
+                "headcount_6m_ago": company_data.get("headcount_6m_ago"),
+                "headcount_growth_rate": company_data.get("headcount_growth_rate"),
+                "recent_job_postings": company_data.get("recent_job_postings"),
+                "hiring_departments": company_data.get("hiring_departments") or []
+            }
 
-            # Step 3d: Web search fallback for missing data
-            domain = company_data.get("website") or company.get("domain", "")
-            web_query = f"{company_name} {filters.get('sector', '')} startup funding"
+            # Step 6: Web search for market data + github/research details Crustdata doesn't have
+            web_query = f"{company_name} {filters.get('sector', '')} startup"
             web_data = web_search(web_query)
             if domain:
-                web_data += " " + web_search(f"site:{domain} product features")
+                web_data += " " + web_search(f"site:{domain} product")
+            for fi in fi_list:
+                github = fi.get("github") or {}
+                research = fi.get("research") or {}
+                name = fi.get("name", "")
+                if github.get("has_github"):
+                    web_data += " " + web_search(f"{name} github repositories languages")
+                if research.get("has_publications"):
+                    web_data += " " + web_search(f"{name} research papers publications")
 
-            # Step 4: Generate memo
+            # Step 7: Generate memo
             jobs[job_id]["progress"]["stage"] = "memo_generation"
-            memo = generate_memo(company_data, founder_data, signals_raw, web_data)
+            memo = generate_memo(company_data, fi_list, signals_raw, web_data)
 
-            # Step 5: Make decision
-            founder_summary = "; ".join([
-                f"{f.get('name')} — {f.get('current_title')} — prev: {', '.join([r.get('company','') for r in f.get('past_roles', [])[:2]])}"
-                for f in founder_data
-            ]) or "No founder data available"
-
+            # Step 8: Make decision
+            founder_summary = build_founder_summary(fi_list)
             decision_data = make_decision(memo, signals_raw, founder_summary, thesis)
 
-            # Step 6: Check exception threshold
-            missing_count = count_unavailable(company_data, founder_data)
+            # Step 9: Exception checks
+            missing_count = count_unavailable(company_data, fi_list)
             if missing_count >= EXCEPTION_THRESHOLD and not decision_data.get("exception_flag"):
                 decision_data["exception_flag"] = True
                 decision_data["exception_reason"] = f"{missing_count} key data fields unavailable"
 
-            # Step 7: Draft outreach if meet
+            part_time = [fi for fi in fi_list if fi.get("possible_part_time_founder")]
+            if part_time and not decision_data.get("exception_flag"):
+                decision_data["exception_flag"] = True
+                decision_data["exception_reason"] = (
+                    f"Possible part-time founder: {', '.join(f.get('name','') for f in part_time)}"
+                )
+
+            # Step 10: Draft outreach if meet
             outreach = None
-            if decision_data.get("decision") == "meet" and founder_data:
-                primary_founder = founder_data[0]
-                past_companies = [r.get("company", "") for r in primary_founder.get("past_roles", [])[:2]]
+            if decision_data.get("decision") == "meet" and fi_list:
+                primary = fi_list[0]
+                past_companies = [r.get("company", "") for r in (primary.get("past_roles") or [])[:2]]
                 outreach = draft_outreach(
-                    founder_name=primary_founder.get("name", "Founder"),
-                    founder_background=f"{primary_founder.get('current_title')} — previously at {', '.join(past_companies)}",
+                    founder_name=primary.get("name", "Founder"),
+                    founder_background=f"{primary.get('current_title')} — previously at {', '.join(past_companies)}",
                     company_name=company_name,
                     company_summary=memo.get("summary", ""),
                     decision_reasoning=decision_data.get("reasoning", "")
                 )
-                # Send to demo inbox — never to the real founder email (hackathon rules)
-                if crustdata_ready and outreach:
-                    real_email_data = find_email(
-                        primary_founder.get("linkedin_url"), company_id
-                    )
+                if crustdata_ready and outreach and find_email and outreach_recipient:
+                    real_email_data = find_email(primary.get("linkedin_url"), company_id)
                     real_email = real_email_data.get("email") if real_email_data else None
-                    recipient = outreach_recipient(
-                        primary_founder.get("crustdata_person_id"), real_email
-                    )
+                    recipient = outreach_recipient(primary.get("crustdata_person_id"), real_email)
                     if recipient:
                         send_outreach_email(
                             send_to=recipient["send_to"],
-                            intended_for=real_email or primary_founder.get("name", "founder"),
+                            intended_for=real_email or primary.get("name", "founder"),
                             subject=f"Quick note on {company_name}",
                             body=outreach
                         )
 
-            # Step 8: Set watcher if watch
+            # Step 11: Set watcher if watch
             if crustdata_ready and company_id and decision_data.get("decision") == "watch":
                 watch_company(
                     company_id=company_id,
-                    headcount_threshold=signals_raw.get("headcount_now", 0) + 5
+                    headcount_threshold=(signals_raw.get("headcount_now") or 0) + 5
                 )
 
-            # Step 9: Build citations
-            citations = build_citations(company_data, founder_data, web_data)
+            # Step 12: Build citations and assemble result
+            citations = build_citations(company_data, fi_list, web_data)
 
-            # Step 10: Assemble result
             founders = [
                 Founder(
-                    name=f.get("name", "Unknown"),
-                    current_title=f.get("current_title"),
-                    education=f.get("education"),
-                    past_companies=[r.get("company", "") for r in f.get("past_roles", [])[:3]],
-                    part_time_flag=f.get("possible_part_time_founder", False)
+                    name=fi.get("name", "Unknown"),
+                    current_title=fi.get("current_title"),
+                    education=fi.get("education"),
+                    past_companies=[r.get("company", "") for r in (fi.get("past_roles") or [])[:3]],
+                    part_time_flag=fi.get("possible_part_time_founder", False)
                 )
-                for f in founder_data
+                for fi in fi_list
             ]
 
             comp_landscape = [
@@ -354,8 +413,8 @@ async def run_pipeline(thesis: dict, job_id: str, jobs: dict):
                 company_name=company_name,
                 domain=domain,
                 founded=company_data.get("founded_year"),
-                location=company_data.get("location") or company.get("location"),
-                stage=thesis.get("stage"),
+                location=company_data.get("location"),
+                stage=company_data.get("stage") or thesis.get("stage"),
                 total_funding=company_data.get("total_funding"),
                 decision=Decision(decision_data.get("decision", "watch")),
                 confidence=decision_data.get("confidence", "low"),
@@ -377,7 +436,6 @@ async def run_pipeline(thesis: dict, job_id: str, jobs: dict):
                 exception_reason=decision_data.get("exception_reason"),
                 outreach_email=outreach
             )
-
             results.append(result.model_dump())
 
         jobs[job_id]["status"] = "done"
@@ -400,46 +458,54 @@ async def run_backtest_pipeline(thesis: dict, job_id: str, jobs: dict, as_of_dat
     """
     try:
         from crustdata.client import (
-            search_companies, get_company_details,
-            get_person_details, search_people,
-            snapshot_as_of, outcome_rounds
+            search_founders, founder_insights, outcome_rounds
         )
 
         jobs[job_id]["progress"]["stage"] = "discovery"
         filters = parse_thesis(thesis)
 
-        # Search on stable fields only — no headcount/funding filters
-        companies = search_companies(
-            sector=filters.get("sector"),
-            geography=filters.get("geography"),
-            keywords=filters.get("keywords", []),
-            # deliberately omit stage/headcount/funding filters for backtest
-            limit=10
+        # Search on stable fields only — no headcount/funding (today's values leak future data)
+        people = search_founders(
+            country=filters.get("geography"),
+            schools=filters.get("schools", []),
+            fields_of_study=filters.get("fields_of_study", []),
+            past_companies=filters.get("past_companies", []),
+            past_titles=filters.get("past_titles", []),
+            expertise_keywords=filters.get("expertise_keywords", [])
         ) or []
+
+        if not people:
+            jobs[job_id]["status"] = "done"
+            jobs[job_id]["results"] = []
+            jobs[job_id]["backtest_summary"] = {"as_of_date": as_of_date, "total_companies": 0}
+            return
+
+        # founder_insights with as_of drops later roles and exits
+        # Note: investor lists, GitHub and research are today's values (leakage_warnings from Bhav)
+        insights = founder_insights(people, as_of=as_of_date) or {}
+
+        # Group by company
+        companies: dict = {}
+        for person_id, fi in insights.items():
+            company = fi.get("company") or {}
+            company_key = company.get("crustdata_company_id") or company.get("name") or person_id
+            if company_key not in companies:
+                companies[company_key] = {"company_data": company, "founders": []}
+            companies[company_key]["founders"].append(fi)
 
         jobs[job_id]["progress"]["companies_found"] = len(companies)
 
         results = []
-        for i, company in enumerate(companies):
+        for i, (_, group) in enumerate(companies.items()):
             jobs[job_id]["progress"]["companies_processed"] = i
-            company_id = company.get("crustdata_company_id") or company.get("id")
-            company_name = company.get("name", "Unknown")
+            company_data = group["company_data"]
+            fi_list = group["founders"]
+            company_name = company_data.get("name") or "Unknown"
+            company_id = company_data.get("crustdata_company_id")
 
-            # Get historical snapshot as of backtest date
-            company_data = get_company_details(company_id) or {}
-            historical_profile = snapshot_as_of(company_data, as_of_date)
-
-            founder_data = []
-            people = search_people(company_id=company_id, founder_only=True) or []
-            for person in people[:3]:
-                person_id = person.get("crustdata_person_id") or person.get("id")
-                if person_id:
-                    details = get_person_details(person_id) or {}
-                    founder_data.append(snapshot_as_of(details, as_of_date))
-
-            # Historical signals only
+            # Historical signals only — no headcount growth rate (would leak)
             signals_raw = {
-                "headcount_now": historical_profile.get("headcount"),
+                "headcount_now": company_data.get("headcount"),
                 "headcount_6m_ago": None,
                 "headcount_growth_rate": None,
                 "recent_job_postings": None,
@@ -447,17 +513,12 @@ async def run_backtest_pipeline(thesis: dict, job_id: str, jobs: dict, as_of_dat
             }
 
             web_data = web_search(f"{company_name} {filters.get('sector', '')} startup")
-            memo = generate_memo(historical_profile, founder_data, signals_raw, web_data)
-
-            founder_summary = "; ".join([
-                f"{f.get('name')} — {f.get('current_title')}"
-                for f in founder_data
-            ]) or "No founder data"
-
+            memo = generate_memo(company_data, fi_list, signals_raw, web_data)
+            founder_summary = build_founder_summary(fi_list)
             decision_data = make_decision(memo, signals_raw, founder_summary, thesis)
 
             # Check actual outcome: did they raise after as_of_date?
-            actual_rounds = outcome_rounds(company_id, after_date=as_of_date) or []
+            actual_rounds = outcome_rounds(company_id, after_date=as_of_date) or [] if company_id else []
             did_raise = len(actual_rounds) > 0
 
             result = {
