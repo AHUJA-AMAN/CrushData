@@ -10,6 +10,7 @@ from crustdata.client import (
     enrich_companies,
     enrich_people,
     find_email,
+    founder_insights,
     get_credits,
     get_hiring,
     headcount_signals,
@@ -27,7 +28,7 @@ from crustdata.client import (
 
 __all__ = [
     "EARLY_STAGES", "FOUNDER_TITLES", "Company", "CompanyProfile", "HeadcountSignals", "Hiring", "Person",
-    "cancel_watch", "enrich_companies", "enrich_people", "find_email", "outreach_recipient", "get_credits", "get_hiring", "headcount_signals",
+    "cancel_watch", "enrich_companies", "enrich_people", "find_email", "founder_insights", "outreach_recipient", "get_credits", "get_hiring", "headcount_signals",
     "identify_company", "list_watches", "parse_watch_event", "ping", "search_companies", "search_founders",
     "set_cache_mode", "snapshot_as_of", "watch_company",
 ]  # fmt: skip

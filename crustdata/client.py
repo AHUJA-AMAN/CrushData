@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
@@ -75,6 +76,8 @@ class Role(TypedDict):
     seniority_level: str | None
     function_category: str | None
     company_industries: list[str]
+    company_headcount: int | None
+    location: str | None
     description: str | None
 
 
@@ -84,14 +87,27 @@ class School(TypedDict):
     field_of_study: str | None
     start_year: int | None
     end_year: int | None
+    country: str | None
+
+
+class ResearchProfile(TypedDict):
+    name: str | None
+    affiliation: str | None
+    profile_url: str | None
+    interests: list[str]
+    article_count: int | None
+    citations: int | None
+    h_index: int | None
+    top_articles: list[dict[str, Any]]  # [{title, year, citations, url}] most cited first, max 5
 
 
 class Person(TypedDict):
     crustdata_person_id: int | None
     name: str | None
     headline: str | None
-    current_title: str | None
+    current_title: str | None  # PRIMARY current title
     location: str | None
+    country: str | None
     linkedin_url: str | None
     current_roles: list[Role]
     founder_roles: list[Role]  # current roles whose title says founder/CEO/CTO; may not be their primary job
@@ -99,6 +115,7 @@ class Person(TypedDict):
     education: list[School]
     skills: list[str]
     recently_changed_jobs: bool | None
+    research_profiles: list[ResearchProfile]  # academic author profiles (publications); [] = none found
     source: Source
 
 
@@ -351,7 +368,29 @@ def _norm_role(r: dict[str, Any]) -> Role:
         "seniority_level": r.get("seniority_level"),
         "function_category": r.get("function_category"),
         "company_industries": r.get("company_industries") or [],
+        "company_headcount": r.get("company_headcount_latest"),
+        "location": r.get("location") if isinstance(r.get("location"), str) else (r.get("location") or {}).get("raw"),
         "description": desc[:400] if isinstance(desc, str) and desc else None,
+    }
+
+
+def _loc_country(loc: Any) -> str | None:
+    return loc.get("country") if isinstance(loc, dict) else None
+
+
+def _norm_research(rp: dict[str, Any]) -> ResearchProfile:
+    arts = sorted(rp.get("articles") or [], key=lambda a: a.get("total_citations") or 0, reverse=True)[:5]
+    return {
+        "name": rp.get("name"),
+        "affiliation": rp.get("affiliated_organisation") or rp.get("designation"),
+        "profile_url": rp.get("profile_url"),
+        "interests": rp.get("research_interests") or [],
+        "article_count": rp.get("article_count"),
+        "citations": (rp.get("citations_count") or {}).get("all"),
+        "h_index": (rp.get("h_index") or {}).get("all"),
+        "top_articles": [
+            {"title": a.get("title"), "year": a.get("publication_year"), "citations": a.get("total_citations"), "url": a.get("url")} for a in arts
+        ],
     }
 
 
@@ -375,6 +414,7 @@ def _norm_person(p: dict[str, Any], endpoint: str, retrieved_at: str) -> Person:
         "headline": bp.get("headline"),
         "current_title": bp.get("current_title"),
         "location": location,
+        "country": _loc_country(loc),
         "linkedin_url": linkedin,
         "current_roles": current,
         "founder_roles": [r for r in current if _is_founder_title(r["title"])],
@@ -386,11 +426,13 @@ def _norm_person(p: dict[str, Any], endpoint: str, retrieved_at: str) -> Person:
                 "field_of_study": s.get("field_of_study") or None,
                 "start_year": s.get("start_year"),
                 "end_year": s.get("end_year"),
+                "country": _loc_country(s.get("location")),
             }
             for s in schools
         ],
         "skills": (p.get("skills") or {}).get("professional_network_skills") or [],
         "recently_changed_jobs": exp.get("recently_changed_jobs"),
+        "research_profiles": [_norm_research(rp) for rp in p.get("research_profiles") or [] if isinstance(rp, dict)],
         "source": _source(endpoint, retrieved_at, p.get("crustdata_person_id"), linkedin),
     }
 
@@ -563,49 +605,83 @@ def search_companies(
     return list(out.values())
 
 
+_ISO3_TO_COUNTRY = {
+    "IND": "India", "USA": "United States", "GBR": "United Kingdom", "SGP": "Singapore", "ARE": "United Arab Emirates",
+    "CAN": "Canada", "DEU": "Germany", "FRA": "France", "AUS": "Australia", "NLD": "Netherlands", "ISR": "Israel",
+    "IDN": "Indonesia", "JPN": "Japan", "CHN": "China", "BRA": "Brazil", "IRL": "Ireland", "CHE": "Switzerland",
+}  # fmt: skip
+
+
+def _any_of(field: str, op: str, values: list[str]) -> dict[str, Any]:
+    conds = [{"field": field, "type": op, "value": v} for v in values]
+    return conds[0] if len(conds) == 1 else {"op": "or", "conditions": conds}
+
+
+def _resolve_company_ids(names: list[str]) -> list[int]:
+    """Company names -> Crustdata ids via free identify; keeps every top-confidence match."""
+    ids: list[int] = []
+    for name in names:
+        matches = identify_company(name=name) or []
+        best = max((m.get("confidence") or 0 for m in matches), default=0)  # type: ignore[attr-defined]
+        ids += [m["crustdata_company_id"] for m in matches if m["crustdata_company_id"] and best >= 0.8 and (m.get("confidence") or 0) >= best - 0.05]  # type: ignore[attr-defined]
+    return list(dict.fromkeys(ids))
+
+
 def search_founders(
     *,
     company_ids: list[int] | None = None,
     titles: list[str] | None = None,
     country: str | None = None,
-    past_keywords: list[str] | None = None,
-    past_company_ids: list[int] | None = None,
     schools: list[str] | None = None,
+    fields_of_study: list[str] | None = None,
+    past_companies: list[str] | None = None,
+    past_company_ids: list[int] | None = None,
+    past_titles: list[str] | None = None,
+    expertise_keywords: list[str] | None = None,
+    past_keywords: list[str] | None = None,
     extra_filters: list[dict[str, Any]] | None = None,
     limit: int = 25,
 ) -> list[Person] | None:
-    """Find founders, with full career history and education included (no enrich call needed).
+    """Find founders, with career history, education, skills and research profiles included.
 
-    ~0.4 credits per result. titles: current-title words, default FOUNDER_TITLES.
-    country: full name, e.g. "India" (person data uses full names, not ISO codes).
-    past_keywords: any past role whose title or description mentions one of these
-      (e.g. ["infrastructure", "platform", "devops", "SRE"]) - the "prior experience" filter.
+    Every list argument is OR within itself and AND across arguments. ~0.8 credits per result.
+    titles: current-title words, default FOUNDER_TITLES (matches ANY current role, so side
+      founders come back too; see founder_insights()["possible_part_time_founder"]).
+    country: "India" or ISO-3 "IND". schools: e.g. ["IIT Kanpur", "Indian Institute of Technology Kanpur"].
+    fields_of_study: e.g. ["Computer Science"]. past_companies: names, resolved to Crustdata ids
+      (falls back to fuzzy name match). past_titles: e.g. ["SRE", "platform engineer"].
+    expertise_keywords: domain words matched against skills, headline and past role descriptions.
+    past_keywords: legacy, matches past role titles or descriptions.
     """
-    conds: list[dict[str, Any]] = [
-        {"op": "or", "conditions": [{"field": "experience.employment_details.current.title", "type": "(.)", "value": t} for t in titles or FOUNDER_TITLES]}
-    ]
+    exp = "experience.employment_details"
+    conds: list[dict[str, Any]] = [_any_of(f"{exp}.current.title", "(.)", titles or FOUNDER_TITLES)]
     if company_ids:
-        conds.append({"field": "experience.employment_details.current.company_id", "type": "in", "value": company_ids})
+        conds.append({"field": f"{exp}.current.company_id", "type": "in", "value": company_ids})
     if country:
-        conds.append({"field": "basic_profile.location.country", "type": "=", "value": country})
-    if past_keywords:
-        conds.append(
-            {
-                "op": "or",
-                "conditions": [{"field": "experience.employment_details.past.title", "type": "(.)", "value": k} for k in past_keywords]
-                + [{"field": "experience.employment_details.past.description", "type": "[.]", "value": k} for k in past_keywords],
-            }
-        )
-    if past_company_ids:
-        conds.append({"field": "experience.employment_details.past.company_id", "type": "in", "value": past_company_ids})
+        conds.append({"field": "basic_profile.location.country", "type": "=", "value": _ISO3_TO_COUNTRY.get(country.upper(), country)})
     if schools:
-        conds.append({"op": "or", "conditions": [{"field": "education.schools.school", "type": "(.)", "value": s} for s in schools]})
+        conds.append(_any_of("education.schools.school", "(.)", schools))
+    if fields_of_study:
+        conds.append(_any_of("education.schools.field_of_study", "(.)", fields_of_study))
+    if past_companies or past_company_ids:
+        ids = list(dict.fromkeys((past_company_ids or []) + _resolve_company_ids(past_companies or [])))
+        alts: list[dict[str, Any]] = [{"field": f"{exp}.past.company_id", "type": "in", "value": ids}] if ids else []
+        alts += [{"field": f"{exp}.past.company_name", "type": "(.)", "value": n} for n in past_companies or []]
+        conds.append(alts[0] if len(alts) == 1 else {"op": "or", "conditions": alts})
+    if past_titles:
+        conds.append(_any_of(f"{exp}.past.title", "(.)", past_titles))
+    if expertise_keywords:
+        kw = expertise_keywords
+        conds.append({"op": "or", "conditions": [_any_of("skills.professional_network_skills", "(.)", kw), _any_of("basic_profile.headline", "[.]", kw),
+                                                 _any_of(f"{exp}.past.description", "[.]", kw), _any_of(f"{exp}.current.description", "[.]", kw)]})  # fmt: skip
+    if past_keywords:
+        conds.append({"op": "or", "conditions": [_any_of(f"{exp}.past.title", "(.)", past_keywords), _any_of(f"{exp}.past.description", "[.]", past_keywords)]})
     conds.extend(extra_filters or [])
 
     body = {
-        "filters": {"op": "and", "conditions": conds},
+        "filters": conds[0] if len(conds) == 1 else {"op": "and", "conditions": conds},
         "limit": max(1, min(limit, 100)),
-        "fields": ["crustdata_person_id", "basic_profile", "experience", "education", "social_handles", "skills"],
+        "fields": ["crustdata_person_id", "basic_profile", "experience", "education", "social_handles", "skills", "research_profiles"],
     }
     data, at = _cached_post("/person/search", body)
     if data is None:
@@ -613,6 +689,9 @@ def search_founders(
     out: dict[Any, Person] = {}
     for p in data.get("profiles") or []:
         person = _norm_person(p, "/person/search", at)
+        # Fuzzy title match lets "Founding Engineer" through; with default titles keep real founders only.
+        if titles is None and not person["founder_roles"]:
+            continue
         out.setdefault(person["crustdata_person_id"], person)
     return list(out.values())
 
@@ -683,7 +762,7 @@ def enrich_people(linkedin_urls: list[str]) -> dict[str, Person | None] | None:
     errors: list[str] = []
     ok = False
     for batch in _chunks(urls, 25):
-        body = {"professional_network_profile_urls": batch, "fields": ["basic_profile", "experience", "education", "skills", "social_handles"]}
+        body = {"professional_network_profile_urls": batch, "fields": ["basic_profile", "experience", "education", "skills", "social_handles", "research_profiles"]}
         data, at = _cached_post("/person/enrich", body)
         if data is None:
             errors.append(last_error or "unknown error")
@@ -871,6 +950,327 @@ def get_hiring(company_id: int, *, window_days: int = 90, as_of: str | date | No
     }
 
 
+# ------------------------------------------------------------ founder insights
+
+# Canonical investor -> word-boundary aliases (lowercase). Accelerators + top India/global VCs.
+# ponytail: hand-kept list; any investor Crustdata tags "accelerator" is also caught via categories.
+NOTABLE_INVESTORS: dict[str, list[str]] = {
+    "Y Combinator": ["y combinator", "ycombinator"], "Sequoia / Peak XV": ["sequoia", "peak xv", "surge"],
+    "Accel": ["accel", "accel partners"], "Lightspeed": ["lightspeed"], "Andreessen Horowitz": ["andreessen", "a16z"],
+    "Tiger Global": ["tiger global"], "SoftBank": ["softbank"], "General Catalyst": ["general catalyst"],
+    "Elevation Capital": ["elevation capital", "saif partners"], "Matrix Partners / Z47": ["matrix partners", "z47"],
+    "Blume Ventures": ["blume"], "Kalaari Capital": ["kalaari"], "Nexus Venture Partners": ["nexus venture"],
+    "Chiratae Ventures": ["chiratae", "idg ventures india"], "Stellaris": ["stellaris"], "3one4 Capital": ["3one4"],
+    "Prosus / Naspers": ["prosus", "naspers"], "Info Edge Ventures": ["info edge"], "Together Fund": ["together fund"],
+    "Antler": ["antler"], "Techstars": ["techstars"], "500 Global": ["500 startups", "500 global"],
+    "Entrepreneur First": ["entrepreneur first"], "Pioneer Fund": ["pioneer fund"], "SV Angel": ["sv angel"],
+    "Founders Fund": ["founders fund"], "Benchmark": ["benchmark capital", "benchmark"], "Index Ventures": ["index ventures"],
+    "Greylock": ["greylock"], "Kleiner Perkins": ["kleiner"], "Bessemer": ["bessemer"], "Insight Partners": ["insight partners"],
+    "Khosla Ventures": ["khosla"], "GV (Google Ventures)": ["google ventures", "gv"], "Elevar Equity": ["elevar"],
+    "Better Capital": ["better capital"], "Venture Highway": ["venture highway"], "Alpha Wave": ["alpha wave"],
+}  # fmt: skip
+_INVESTOR_RES = [(canon, re.compile(r"\b(" + "|".join(re.escape(a) for a in aliases) + r")\b")) for canon, aliases in NOTABLE_INVESTORS.items()]
+_YC_BATCH = re.compile(r"\(YC [A-Z]\d{2}\)|\bYC [SWFX]\d{2}\b")
+_INTERN = re.compile(r"\b(intern|internship|trainee|student|apprentice)\b", re.I)
+_TECH_DEGREE = re.compile(r"comput|software|electric|electron|mechanic|engineer|b\.?\s?tech|m\.?\s?tech|\bb\.?e\b|math|physics|statistic|data|information tech|artificial|machine learning|\bai\b", re.I)
+_TECH_ROLE = re.compile(r"engineer|developer|\bsde\b|programmer|architect|scientist|\bcto\b|devops|\bsre\b|technical|researcher|ml\b", re.I)
+_TECH_FUNCTIONS = {"Engineering", "Information Technology", "Research", "Quality Assurance"}
+_PHD = re.compile(r"\b(ph\.?\s?d|doctor|dphil)\b", re.I)
+_MASTER = re.compile(r"\b(master|m\.?\s?tech|m\.?\s?sc?|m\.?e|mba|m\.?a|pgdm|post\s?graduate)\b", re.I)
+_BACHELOR = re.compile(r"\b(bachelor|b\.?\s?tech|b\.?\s?e|b\.?\s?sc?|b\.?\s?a|bba|b\.?\s?com|undergrad\w*|dual degree|integrated)\b", re.I)
+
+
+def _notable(names: list[str]) -> list[str]:
+    hits = [canon for canon, rx in _INVESTOR_RES if any(rx.search(n.lower()) for n in names)]
+    return list(dict.fromkeys(hits))
+
+
+def _career_companies(ids: list[int]) -> tuple[dict[int, dict[str, Any]], str | None]:
+    """Exit + investor facts for every company in someone's career. 2 credits per company (cached)."""
+    out: dict[int, dict[str, Any]] = {}
+    errors: list[str] = []
+    for batch in _chunks(list(dict.fromkeys(ids)), 25):
+        data, at = _cached_post("/company/enrich", {"crustdata_company_ids": batch, "fields": ["basic_info", "funding", "revenue", "taxonomy"]})
+        if data is None:
+            errors.append(last_error or "unknown error")
+            continue
+        for entry in data if isinstance(data, list) else []:
+            for m in (entry.get("matches") or [])[:1]:
+                c = m.get("company_data") or {}
+                bi, fu, rev = c.get("basic_info") or {}, c.get("funding") or {}, c.get("revenue") or {}
+                detailed = fu.get("investors_detailed") or []
+                names = [i.get("name") for i in detailed if i.get("name")] + _split_names(fu.get("investors"))
+                names += [n for ms in fu.get("milestones") or [] for n in _split_names(ms.get("investors"))]
+                names = list(dict.fromkeys(names))
+                pm = rev.get("public_markets") or {}
+                cid = c.get("crustdata_company_id") or bi.get("crustdata_company_id")
+                tax = c.get("taxonomy") or {}
+                industries = " ".join(tax.get("professional_network_industries") or [tax.get("professional_network_industry") or ""]).lower()
+                out[cid] = {
+                    "name": bi.get("name"),
+                    # Crustdata flags any corporate that invests (e.g. TATA Power); require a VC-type industry too.
+                    "is_investor": bool(fu.get("is_investor")) and ("venture capital" in industries or "investment" in industries),
+                    "investors": names,
+                    "notable_investors": _notable(names) + (["Y Combinator"] if _YC_BATCH.search(bi.get("name") or "") and "Y Combinator" not in _notable(names) else []),
+                    "accelerator_investors": [i.get("name") for i in detailed if "accelerator" in (i.get("categories") or [])],
+                    "acquired_by": [{"acquirer": a.get("name"), "date": _day(a.get("date")), "amount_usd": a.get("amount_usd")} for a in fu.get("acquired_by") or []],
+                    "acquisition_status": rev.get("acquisition_status"),
+                    "ipo_date": _day(pm.get("ipo_date")),
+                    "status": bi.get("status"),
+                    "source": _source("/company/enrich", at, cid, bi.get("professional_network_url")),
+                }
+    return out, "; ".join(errors) or None
+
+
+def _github_signals(person_ids: list[int]) -> dict[int, dict[str, Any]]:
+    """GitHub facts via filter-only search (Crustdata can't return repo details on our plan).
+
+    One search per threshold across all people; a check that errors leaves its value None (unknown).
+    """
+    checks = {
+        "has_github": {"field": "dev_platform_profiles.public_repo_count", "type": "=>", "value": 1},
+        "stars_10": {"field": "dev_platform_profiles.total_stars", "type": "=>", "value": 10},
+        "stars_100": {"field": "dev_platform_profiles.total_stars", "type": "=>", "value": 100},
+        "stars_1000": {"field": "dev_platform_profiles.total_stars", "type": "=>", "value": 1000},
+        "followers_100": {"field": "dev_platform_profiles.followers", "type": "=>", "value": 100},
+    }
+    hits: dict[str, set[int] | None] = {}
+    for name, cond in checks.items():
+        found: set[int] | None = set()
+        for batch in _chunks(person_ids, 100):
+            body = {"filters": {"op": "and", "conditions": [{"field": "crustdata_person_id", "type": "in", "value": batch}, cond]},
+                    "limit": len(batch), "fields": ["crustdata_person_id"]}  # fmt: skip
+            data, _ = _cached_post("/person/search", body)
+            if data is None:
+                found = None
+                break
+            found |= {p.get("crustdata_person_id") for p in data.get("profiles") or []}  # type: ignore[operator]
+        hits[name] = found
+
+    def has(name: str, pid: int) -> bool | None:
+        s = hits[name]
+        return None if s is None else pid in s
+
+    out = {}
+    for pid in person_ids:
+        stars = None
+        if hits["stars_10"] is not None and hits["stars_100"] is not None and hits["stars_1000"] is not None:
+            stars = "1000+" if has("stars_1000", pid) else "100-999" if has("stars_100", pid) else "10-99" if has("stars_10", pid) else "<10"
+        out[pid] = {"has_github": has("has_github", pid), "total_stars_bucket": stars if has("has_github", pid) else None,
+                    "followers_100_plus": has("followers_100", pid)}  # fmt: skip
+    return out
+
+
+def _estimate_birth_year(education: list[School], roles: list[Role]) -> dict[str, Any]:
+    """Birth-year range from education years (degree-level offsets) or, failing that, first job."""
+    # Typical age at the start / end of each degree. Bachelor's is the most reliable anchor, so it wins.
+    levels = [("bachelor's", _BACHELOR, 18, 22), ("master's", _MASTER, 22, 24), ("PhD", _PHD, 23, 28)]
+    best: tuple[int, int, str] | None = None  # (birth_year, +/- years, method)
+    for label, rx, start_age, end_age in levels:
+        for s in education:
+            if not (s["degree"] and rx.search(s["degree"])):
+                continue
+            if s["start_year"]:
+                best = (s["start_year"] - start_age, 1, f"{label} start year {s['start_year']} - {start_age}")
+            elif s["end_year"]:
+                best = (s["end_year"] - end_age, 1, f"{label} end year {s['end_year']} - {end_age}")
+            if best:
+                break
+        if best:
+            break
+    if best is None:
+        starts = [s["start_year"] for s in education if s["start_year"]]
+        if starts:
+            best = (min(starts) - 18, 3, f"earliest education start {min(starts)} - 18 (degree level unknown)")
+    if best is None:
+        firsts = sorted(r["start_date"] for r in roles if r["start_date"] and not _INTERN.search(r["title"] or ""))
+        if firsts:
+            y = int(firsts[0][:4])
+            best = (y - 22, 3, f"first full-time role {y} - 22 (no education years)")
+    if best is None:
+        return {"birth_year_range": None, "method": "no education or career dates on file", "confidence": "unknown"}
+    by, spread, method = best
+    return {"birth_year_range": [by - spread, by + spread], "method": method, "confidence": "medium" if spread == 1 else "low"}
+
+
+def founder_insights(people: list[Person], *, as_of: str | date | None = None, include_github: bool = True) -> dict[Any, dict[str, Any]] | None:
+    """Everything the agent needs to judge a founder, derived from Crustdata, keyed by crustdata_person_id.
+
+    Per founder (all facts carry the data they came from):
+      age: estimated birth_year_range / age_range + method + confidence (from education years)
+      nationality_signals: current_country, current_location, education_countries, work_locations
+      years_of_experience: from first non-intern role to as_of (Crustdata's own field is disabled on our plan)
+      founded_companies, past_founder_roles, founder_company_count, serial_founder, previous_startup_experience
+      possible_part_time_founder: has a founder role but primary title is something else
+      open_ended_past_roles: past roles with no end date (side/advisory roles, NOT the primary job)
+      technical: is_technical (True/False/None) + degree_technical, technical_career_share, first_role_technical
+      company: primary founder company id/name, team_size (headcount), founder_count, co_founded, cofounders
+      exits: acquisitions/IPOs of companies in their career + exit_status verified/employee_exit_only/unverified
+      investor_association: trust_level + backed_companies (notable/accelerator investors) + worked_at_investor
+      github: has_github, total_stars_bucket, followers_100_plus (filter-only; None = unknown)
+      research: has_publications, article_count, citations, h_index, profiles
+      not_on_crustdata: what the agent must web-search
+    Costs: 2 credits per career company (cached, shared across founders) + small GitHub checks.
+    as_of (backtest): ignores roles started and exits dated after it; see leakage_warnings.
+    """
+    global last_error
+    ref = _as_date(as_of) or date.today()
+    day = ref.isoformat()
+    people = [p for p in people if p]
+    if not people:
+        return {}
+    errors: list[str] = []
+
+    def trim(roles: list[Role]) -> list[Role]:
+        return [r for r in roles if not as_of or (r["start_date"] and r["start_date"] <= day)]
+
+    # 1) one batched lookup for every company anyone worked at
+    career_ids = [r["crustdata_company_id"] for p in people for r in p["current_roles"] + p["past_roles"] if r["crustdata_company_id"]]
+    companies, err = _career_companies(career_ids)
+    if err:
+        errors.append(f"career companies: {err}")
+    # 2) founders of each person's primary founder company (co-founded vs solo), from full enrich (cached)
+    def primary_founder_role(p: Person) -> Role | None:
+        return next((r for r in trim(p["current_roles"]) if _is_founder_title(r["title"])), None)
+
+    primary_ids = list(dict.fromkeys(r["crustdata_company_id"] for p in people if (r := primary_founder_role(p)) and r["crustdata_company_id"]))
+    profiles = enrich_companies(primary_ids) if primary_ids else {}
+    if primary_ids and profiles is None:
+        errors.append(f"founder companies: {last_error}")
+    # 3) GitHub checks, batched
+    pids = [p["crustdata_person_id"] for p in people if p["crustdata_person_id"]]
+    github = _github_signals(pids) if include_github and pids else {}
+
+    out: dict[Any, dict[str, Any]] = {}
+    for p in people:
+        current, past = trim(p["current_roles"]), trim(p["past_roles"])
+        roles = current + past
+        founder_current = [r for r in current if _is_founder_title(r["title"])]
+        founder_past = [r for r in past if _is_founder_title(r["title"])]
+        founded: dict[Any, dict[str, Any]] = {}
+        for r, status in [(r, "current") for r in founder_current] + [(r, "past") for r in founder_past]:
+            key = r["crustdata_company_id"] or (r["company_name"] or "").lower()
+            founded.setdefault(key, {"company_name": r["company_name"], "crustdata_company_id": r["crustdata_company_id"], "title": r["title"],
+                                     "start_date": r["start_date"], "end_date": r["end_date"], "status": status})  # fmt: skip
+
+        full_time = [r for r in roles if r["start_date"] and not _INTERN.search(r["title"] or "")]
+        start = min((r["start_date"] for r in full_time), default=None)
+        yoe = round((ref - _as_date(start)).days / 365.25, 1) if start and _as_date(start) else None  # type: ignore[operator]
+
+        tech_roles = [r for r in full_time if r["function_category"] in _TECH_FUNCTIONS or _TECH_ROLE.search(r["title"] or "")]
+        degree_tech = any(_TECH_DEGREE.search(f"{s['degree'] or ''} {s['field_of_study'] or ''}") for s in p["education"]) if any(s["degree"] or s["field_of_study"] for s in p["education"]) else None
+        share = round(len(tech_roles) / len(full_time), 2) if full_time else None
+        first = min(full_time, key=lambda r: r["start_date"] or "9") if full_time else None
+        first_tech = (first in tech_roles) if first else None
+        is_tech = None if degree_tech is None and share is None else bool(degree_tech) or (share or 0) >= 0.5
+
+        age = _estimate_birth_year(p["education"], roles)
+        if age["birth_year_range"]:
+            lo, hi = age["birth_year_range"]
+            age["age_range"] = [ref.year - hi, ref.year - lo]
+
+        primary = (founder_current[:1] or [None])[0]
+        prof = (profiles or {}).get(primary["crustdata_company_id"]) if primary and primary["crustdata_company_id"] else None
+        cofounders = [f for f in (prof or {}).get("founders", []) if f["crustdata_person_id"] != p["crustdata_person_id"]]
+
+        exits, backed, worked_at = [], [], []
+        for r in roles:
+            c = companies.get(r["crustdata_company_id"])  # type: ignore[arg-type]
+            if not c:
+                continue
+            was_founder = _is_founder_title(r["title"])
+
+            def in_tenure(d: str | None, r: Role = r) -> bool:
+                # An exit only says something about this person if it happened while they were there
+                # (or within a year of leaving, for deals that close late). Undated exits are kept.
+                if not d:
+                    return True
+                end = r["end_date"] or "9999"
+                end_plus = f"{int(end[:4]) + 1}{end[4:]}" if end != "9999" else end
+                return (r["start_date"] or "0000") <= d <= end_plus and (not as_of or d <= day)
+
+            for a in c["acquired_by"]:
+                if in_tenure(a["date"]):
+                    exits.append({"company_name": c["name"], "crustdata_company_id": r["crustdata_company_id"], "type": "acquired", **a,
+                                  "person_title": r["title"], "person_was_founder": was_founder, "source": c["source"]})  # fmt: skip
+            if not c["acquired_by"] and c["acquisition_status"] == "acquired":
+                exits.append({"company_name": c["name"], "crustdata_company_id": r["crustdata_company_id"], "type": "acquired", "acquirer": None,
+                              "date": None, "amount_usd": None, "person_title": r["title"], "person_was_founder": was_founder, "source": c["source"]})  # fmt: skip
+            if c["ipo_date"] and in_tenure(c["ipo_date"]):
+                exits.append({"company_name": c["name"], "crustdata_company_id": r["crustdata_company_id"], "type": "ipo", "acquirer": None,
+                              "date": c["ipo_date"], "amount_usd": None, "person_title": r["title"], "person_was_founder": was_founder, "source": c["source"]})  # fmt: skip
+            if c["notable_investors"] or c["accelerator_investors"]:
+                backed.append({"company_name": c["name"], "crustdata_company_id": r["crustdata_company_id"], "person_title": r["title"],
+                               "person_was_founder": was_founder, "notable_investors": c["notable_investors"],
+                               "accelerator_investors": c["accelerator_investors"], "source": c["source"]})  # fmt: skip
+            if c["is_investor"] or _notable([c["name"] or ""]):
+                worked_at.append({"firm": c["name"], "title": r["title"], "start_date": r["start_date"], "end_date": r["end_date"], "source": c["source"]})
+        # Several roles at one company -> one entry; keep the founder flag if any role was founder-level.
+        by_co: dict[Any, dict[str, Any]] = {}
+        for b in backed:
+            prev = by_co.setdefault(b["crustdata_company_id"], b)
+            prev["person_was_founder"] = prev["person_was_founder"] or b["person_was_founder"]
+        backed = list(by_co.values())
+        exits = list({(e["crustdata_company_id"], e["type"], e["date"], e.get("acquirer")): e for e in sorted(exits, key=lambda e: e["person_was_founder"])}.values())
+        worked_at = list({w["firm"]: w for w in worked_at}.values())
+        trust = ("founder_backed_by_notable_investor" if any(b["person_was_founder"] for b in backed)
+                 else "employee_at_notable_backed_company" if backed else "worked_at_investor" if worked_at else "none_found")  # fmt: skip
+        founder_exits = [e for e in exits if e["person_was_founder"]]
+        rps = p["research_profiles"]
+
+        out[p["crustdata_person_id"] or p["name"]] = {
+            "crustdata_person_id": p["crustdata_person_id"],
+            "name": p["name"],
+            "as_of": day,
+            "age": age,
+            "nationality_signals": {
+                "current_country": p["country"],
+                "current_location": p["location"],
+                "education_countries": list(dict.fromkeys(s["country"] for s in p["education"] if s["country"])),
+                "work_locations": list(dict.fromkeys(r["location"] for r in roles if r["location"]))[:5],
+            },
+            "years_of_experience": yoe,
+            "career_start": start,
+            "founded_companies": list(founded.values()),
+            "founder_company_count": len(founded),
+            "serial_founder": len(founded) >= 2,
+            "previous_startup_experience": len(founded) >= 2 or bool(founder_past),
+            "past_founder_roles": founder_past,
+            "possible_part_time_founder": bool(founder_current) and not _is_founder_title(p["current_title"]),
+            "open_ended_past_roles": [r for r in past if not r["end_date"]],
+            "technical": {"is_technical": is_tech, "degree_technical": degree_tech, "technical_career_share": share,
+                          "first_role_technical": first_tech, "first_role": first["title"] if first else None},  # fmt: skip
+            "company": {
+                "crustdata_company_id": primary["crustdata_company_id"] if primary else None,
+                "name": primary["company_name"] if primary else None,
+                "team_size": (prof or {}).get("headcount") or (primary["company_headcount"] if primary else None),
+                "founder_count": (len(cofounders) + 1) if prof else None,
+                "co_founded": (bool(cofounders) if prof else None),
+                "cofounders": [{"crustdata_person_id": f["crustdata_person_id"], "name": f["name"], "title": f["current_title"], "linkedin_url": f["linkedin_url"]} for f in cofounders],
+            },
+            "exits": exits,
+            "exit_status": "verified" if founder_exits else "employee_exit_only" if exits else "unverified",
+            "investor_association": {"trust_level": trust, "backed_companies": backed, "worked_at_investor": worked_at},
+            "github": github.get(p["crustdata_person_id"], {"has_github": None, "total_stars_bucket": None, "followers_100_plus": None}),  # type: ignore[arg-type]
+            "research": {
+                "has_publications": bool(rps) and any((r["article_count"] or 0) > 0 for r in rps),
+                "article_count": sum(r["article_count"] or 0 for r in rps) if rps else 0,
+                "citations": sum(r["citations"] or 0 for r in rps) if rps else 0,
+                "h_index": max((r["h_index"] or 0 for r in rps), default=0),
+                "profiles": rps,
+            },
+            "not_on_crustdata": [
+                "GitHub repo names, languages, commit activity (only star/follower thresholds are available)",
+                "open-source contributions to other people's repos",
+                "publications outside Crustdata's research-profile index",
+            ],
+            "leakage_warnings": ["investor_association uses today's investor lists", "github and research are current values"] if as_of else [],
+            "source": p["source"],
+        }
+    last_error = "; ".join(errors) or None
+    return out
+
+
 # --------------------------------------------------------------------- watchers
 
 
@@ -912,7 +1312,8 @@ def watch_company(
     notifications: list[dict[str, Any]] = []
     webhook_url = webhook_url or os.environ.get("WATCH_WEBHOOK_URL", "").strip() or None
     if webhook_url:
-        notifications.append({"type": "webhook", "url": webhook_url})
+        # ngrok's free tier can show a warning page instead of forwarding; this header skips it.
+        notifications.append({"type": "webhook", "url": webhook_url, "headers": {"ngrok-skip-browser-warning": "true"}})
     if notify_emails:
         notifications.append({"type": "email", "to": notify_emails})
     if not notifications:
