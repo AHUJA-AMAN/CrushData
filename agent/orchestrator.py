@@ -29,21 +29,34 @@ _key_index = 0
 
 def call_llm(prompt: str) -> str:
     global _key_index
-    for attempt in range(len(API_KEYS)):
-        try:
-            client = genai.Client(api_key=API_KEYS[_key_index])
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt
-            )
-            return response.text
-        except Exception as e:
-            if "429" in str(e) or "quota" in str(e).lower():
-                _key_index = (_key_index + 1) % len(API_KEYS)
-                time.sleep(2)
-            else:
-                raise
-    raise Exception("All Gemini API keys exhausted")
+    models_to_try = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
+    for model_name in models_to_try:
+        for attempt in range(3):  # 3 retries per model
+            try:
+                client = genai.Client(api_key=API_KEYS[_key_index])
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+                return response.text
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "quota" in err.lower():
+                    # rotate key and retry
+                    _key_index = (_key_index + 1) % len(API_KEYS)
+                    time.sleep(2)
+                elif "503" in err or "UNAVAILABLE" in err or "overload" in err.lower():
+                    # server overloaded — wait longer then try next model
+                    wait = (attempt + 1) * 5
+                    print(f"{model_name} unavailable, waiting {wait}s (attempt {attempt+1})")
+                    time.sleep(wait)
+                elif "404" in err or "NOT_FOUND" in err:
+                    # model doesn't exist — skip to next model immediately
+                    print(f"{model_name} not found, trying next model")
+                    break
+                else:
+                    raise
+    raise Exception("All Gemini models unavailable")
 
 
 def parse_json_response(text: str) -> dict:
