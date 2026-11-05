@@ -46,7 +46,7 @@ def check_transport() -> None:
         with mock.patch.dict(os.environ, {"WATCH_WEBHOOK_URL": "https://x.ngrok.app/webhook"}), \
              mock.patch.object(client._session, "request", return_value=_resp(200, {"id": 77})) as m:  # fmt: skip
             assert client.watch_company(1) == 77
-            assert m.call_args.kwargs["json"]["notifications"] == [{"type": "webhook", "url": "https://x.ngrok.app/webhook"}]
+            assert m.call_args.kwargs["json"]["notifications"][0]["url"] == "https://x.ngrok.app/webhook"
         # search with no criteria refuses without calling the API
         with mock.patch.object(client._session, "request") as m:
             assert client.search_companies() is None and m.call_count == 0
@@ -145,6 +145,53 @@ def check_cache(tmp: str) -> None:
         client.set_cache_mode("on")
 
 
+def check_founder_insights() -> None:
+    assert client._notable(["Accel Partners"]) == ["Accel"] and client._notable(["Some Accelerator"]) == [], "accel != accelerator"
+    assert client._notable(["Peak XV Partners", "Y Combinator"]) == ["Y Combinator", "Sequoia / Peak XV"]
+
+    sch = lambda d, s=None, e=None, c=None: {"school": "X", "degree": d, "field_of_study": "Computer Science", "start_year": s, "end_year": e, "country": c}  # noqa: E731
+    est = client._estimate_birth_year([sch("MBA", 2015), sch("B.Tech", 2008)], [])
+    assert est["birth_year_range"] == [1989, 1991] and "bachelor" in est["method"], "bachelor's start - 18 wins"
+    assert client._estimate_birth_year([sch("Bachelor of Science", None, 2010)], [])["birth_year_range"] == [1987, 1989]
+    assert client._estimate_birth_year([], [])["birth_year_range"] is None
+
+    def role(title: str, cid: int, start: str, end: str | None = None, func: str | None = None) -> dict[str, Any]:
+        return {"title": title, "company_name": f"Co{cid}", "crustdata_company_id": cid, "start_date": start, "end_date": end, "seniority_level": None,
+                "function_category": func, "company_industries": [], "company_headcount": 8, "location": "Bengaluru", "description": None}  # fmt: skip
+
+    person: Any = {
+        "crustdata_person_id": 1, "name": "A", "current_title": "Staff Engineer", "location": "Bengaluru", "country": "India", "linkedin_url": None,
+        "current_roles": [role("Staff Engineer", 10, "2020-01-01", func="Engineering"), role("Co-Founder", 20, "2024-01-01")],
+        "past_roles": [role("Founder", 30, "2015-01-01", "2018-01-01"), role("SDE Intern", 40, "2012-05-01", "2012-08-01"),
+                       role("Advisor", 50, "2019-01-01")],
+        "education": [sch("B.Tech", 2010, 2014, "India")], "research_profiles": [], "source": {},
+    }  # fmt: skip
+    src = {"provider": "crustdata"}
+    companies = {
+        30: {"name": "Co30", "is_investor": False, "investors": ["Y Combinator"], "notable_investors": ["Y Combinator"], "accelerator_investors": ["Y Combinator"],
+             "acquired_by": [{"acquirer": "BigCo", "date": "2018-06-01", "amount_usd": 1e7}], "acquisition_status": "acquired", "ipo_date": None, "status": "active", "source": src},
+        50: {"name": "Blume Ventures", "is_investor": True, "investors": [], "notable_investors": [], "accelerator_investors": [],
+             "acquired_by": [], "acquisition_status": "", "ipo_date": None, "status": "active", "source": src},
+    }  # fmt: skip
+    with mock.patch.object(client, "_career_companies", return_value=(companies, None)), \
+         mock.patch.object(client, "enrich_companies", return_value={20: {"headcount": 8, "founders": [{"crustdata_person_id": 1}, {"crustdata_person_id": 2, "name": "B", "current_title": "CEO", "linkedin_url": None}]}}), \
+         mock.patch.object(client, "_github_signals", return_value={1: {"has_github": True, "total_stars_bucket": "100-999", "followers_100_plus": False}}):  # fmt: skip
+        i = client.founder_insights([person], as_of="2026-01-01")[1]  # type: ignore[index]
+        later = client.founder_insights([person], as_of="2017-01-01")[1]  # type: ignore[index]
+    assert i["possible_part_time_founder"] is True, "primary title isn't founder-level"
+    assert i["serial_founder"] and i["previous_startup_experience"] and i["founder_company_count"] == 2
+    assert [r["title"] for r in i["open_ended_past_roles"]] == ["Advisor"]
+    assert i["years_of_experience"] == 11.0 and i["career_start"] == "2015-01-01", "internships don't start the career"
+    assert i["exit_status"] == "verified" and i["exits"][0]["acquirer"] == "BigCo"
+    assert i["investor_association"]["trust_level"] == "founder_backed_by_notable_investor"
+    assert [w["firm"] for w in i["investor_association"]["worked_at_investor"]] == ["Blume Ventures"]
+    assert i["company"]["co_founded"] is True and i["company"]["founder_count"] == 2 and i["company"]["team_size"] == 8
+    assert i["technical"]["degree_technical"] is True and i["age"]["age_range"] == [33, 35]
+    assert i["nationality_signals"]["education_countries"] == ["India"] and i["github"]["total_stars_bucket"] == "100-999"
+    # backtest: in 2017 the 2018 exit hadn't happened and the 2024 company didn't exist
+    assert later["exit_status"] == "unverified" and later["founder_company_count"] == 1 and later["leakage_warnings"]
+
+
 def offline_checks() -> None:
     import tempfile
 
@@ -153,6 +200,7 @@ def offline_checks() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         check_cache(tmp)
     check_email()
+    check_founder_insights()
     check_signals_and_backtest()
     check_normalizers()
     print("offline checks: OK")
