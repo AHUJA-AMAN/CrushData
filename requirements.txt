@@ -1,2 +1,15 @@
+# Backend
+fastapi
+uvicorn
+python-dotenv
+pydantic
+httpx
+
+# LLM
+google-genai
+
+# Web search
+tavily-python
+
+# Crustdata layer (Bhav)
 requests>=2.31
-python-dotenv>=1.0
