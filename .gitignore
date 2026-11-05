@@ -11,3 +11,4 @@ build/
 .next/
 .DS_Store
 *.log
+.cache/crustdata/private/
