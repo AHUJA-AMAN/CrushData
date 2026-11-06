@@ -114,7 +114,9 @@ async def webhook(payload: dict):
             company_id = event.get("company_id")
             if company_id:
                 # TODO: look up which job this company belongs to and re-run it
-                print(f"Watcher triggered for company {company_id}: {event.get('trigger_type')}")
+                fields = ", ".join(c.get("field", "?") for c in event.get("changes") or [])
+                what = fields or ("test ping" if event.get("is_test") else "unknown change")
+                print(f"Watcher triggered for company {company_id} ({event.get('company_name')}): {what}")
     except Exception as e:
         print(f"Webhook parse error: {e}")
     return {"received": True}

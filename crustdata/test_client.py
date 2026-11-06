@@ -118,6 +118,8 @@ def check_email() -> None:
         assert client.find_email("u")["email"] == "old@other.com"  # type: ignore[index]
     with mock.patch.object(client, "_cached_post", return_value=([{"matched_on": "u", "matches": []}], "t")):
         assert client.find_email("u")["email"] is None  # type: ignore[index]
+    with mock.patch.object(client, "_cached_post") as m:
+        assert client.find_email(None) is None and m.call_count == 0, "no URL -> no API call"  # type: ignore[arg-type]
 
     with mock.patch.dict(os.environ, {"DEMO_RECIPIENTS": "team1@gmail.com, team2@gmail.com,notanemail"}):
         r = client.outreach_recipient(42, "founder@startup.com")
@@ -179,6 +181,7 @@ def check_founder_insights() -> None:
         i = client.founder_insights([person], as_of="2026-01-01")[1]  # type: ignore[index]
         later = client.founder_insights([person], as_of="2017-01-01")[1]  # type: ignore[index]
     assert i["possible_part_time_founder"] is True, "primary title isn't founder-level"
+    assert i["current_title"] == "Staff Engineer" and len(i["past_roles"]) == 3 and i["education"], "insights carry the person record"
     assert i["serial_founder"] and i["previous_startup_experience"] and i["founder_company_count"] == 2
     assert [r["title"] for r in i["open_ended_past_roles"]] == ["Advisor"]
     assert i["years_of_experience"] == 11.0 and i["career_start"] == "2015-01-01", "internships don't start the career"
