@@ -81,7 +81,7 @@ class CompetitorRow(BaseModel):
 class MemoSections(BaseModel):
     summary: str
     problem: str
-    market: str
+    market: str | List[str]
     product: List[str]
     competitive_landscape: List[CompetitorRow]
     x_factor: str
