@@ -7,14 +7,26 @@ function Founders({ company }: { company: CompanyResult }) {
     <div className="block">
       <h4>Founders</h4>
       <ul className="founders">
-        {company.founders.map((f) => (
-          <li key={f.name} className="founder">
+        {company.founders.map((f, i) => (
+          <li key={`${f.name}-${i}`} className="founder">
             <div className="row">
               <strong>{f.name}</strong>
               {f.part_time_flag && <span className="flag">Possible part-time founder</span>}
             </div>
             <div className="muted">{f.current_title}</div>
             <div className="muted">{f.education}</div>
+            {f.email_status !== undefined && (
+              <div className="founder-email">
+                {f.business_email ? (
+                  <>
+                    <code>{f.business_email}</code>
+                    {f.email_status && <span className="muted small"> {f.email_status}</span>}
+                  </>
+                ) : (
+                  <span className="muted small">Business email: {f.email_status ?? "not found"}</span>
+                )}
+              </div>
+            )}
             {f.past_companies.length > 0 && (
               <div className="pills">
                 {f.past_companies.map((c) => (
@@ -33,22 +45,23 @@ function Founders({ company }: { company: CompanyResult }) {
 
 function SignalsBar({ company }: { company: CompanyResult }) {
   const s = company.signals;
-  const negative = s.headcount_growth_rate.trim().startsWith("-");
+  const growth = s.headcount_growth_rate ?? "unknown";
+  const negative = growth.trim().startsWith("-");
   return (
     <div className="signals" aria-label="Signals">
       <div className="signal">
         <span className="signal-label">Headcount</span>
         <span className="signal-value">
-          {s.headcount_6m_ago} → {s.headcount_now}
+          {s.headcount_6m_ago ?? "?"} → {s.headcount_now ?? "?"}
         </span>
       </div>
       <div className="signal">
         <span className="signal-label">Growth (6 mo)</span>
-        <span className={`signal-value ${negative ? "neg" : "pos"}`}>{s.headcount_growth_rate}</span>
+        <span className={`signal-value ${negative ? "neg" : "pos"}`}>{growth}</span>
       </div>
       <div className="signal">
         <span className="signal-label">Open roles</span>
-        <span className="signal-value">{s.recent_job_postings}</span>
+        <span className="signal-value">{s.recent_job_postings ?? "?"}</span>
       </div>
       <div className="signal wide">
         <span className="signal-label">Hiring in</span>
@@ -169,8 +182,8 @@ export default function ResultCard({ company }: { company: CompanyResult }) {
           <div className="meta">
             <span>{company.location}</span>
             <span>Stage: {company.stage}</span>
-            <span>Founded {company.founded}</span>
-            <span>Funding {company.total_funding}</span>
+            {company.founded && <span>Founded {company.founded}</span>}
+            <span>Funding {company.total_funding ?? "unknown"}</span>
             <span>{company.domain}</span>
           </div>
         </div>

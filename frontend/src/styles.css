@@ -507,3 +507,40 @@ tr.self td { background: var(--accent-soft); font-weight: 600; }
   main { padding: 28px 16px 64px; }
   h1 { font-size: 24px; }
 }
+
+/* ---------- Kill button, company picker, live memos ---------- */
+button.danger {
+  background: none;
+  color: #ff5c5c;
+  border: 1px solid rgba(255, 92, 92, 0.55);
+  padding: 8px 16px;
+  border-radius: 10px;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+button.danger:hover:not(:disabled) { background: rgba(255, 92, 92, 0.12); }
+button.danger:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.picker { margin-top: 24px; }
+.picker-head { flex-wrap: wrap; margin-bottom: 10px; }
+.picker-tools { display: flex; gap: 12px; }
+.candidates { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.candidate {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  cursor: pointer;
+}
+.candidate.on { border-color: rgba(255, 102, 0, 0.55); background: var(--accent-soft); }
+.candidate input { margin-top: 4px; accent-color: var(--accent); width: 16px; height: 16px; flex: none; }
+.candidate-body { flex: 1; min-width: 0; }
+.candidate-body p { margin: 6px 0; }
+.candidate-body .row { flex-wrap: wrap; }
+.sticky-actions { position: sticky; bottom: 0; padding: 12px 0; background: var(--bg); }
+.progress-card.live .spinner { display: inline-block; vertical-align: middle; margin-right: 6px; }
+.founder-email { margin-top: 4px; word-break: break-all; }

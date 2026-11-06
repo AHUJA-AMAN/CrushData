@@ -783,6 +783,10 @@ def find_email(linkedin_url: str, company_id: int | None = None) -> EmailLookup 
     one, then whatever exists. email=None means Crustdata has none on file.
     Use the result for the memo / UI only; send via outreach_recipient().
     """
+    global last_error
+    if not linkedin_url:
+        last_error = "find_email needs a LinkedIn URL (this person has none on file)"
+        return None
     body = {"professional_network_profile_urls": [linkedin_url], "fields": ["contact.business_emails"]}
     data, at = _cached_post("/person/enrich", body, private=True)
     if data is None:
@@ -1221,6 +1225,15 @@ def founder_insights(people: list[Person], *, as_of: str | date | None = None, i
         out[p["crustdata_person_id"] or p["name"]] = {
             "crustdata_person_id": p["crustdata_person_id"],
             "name": p["name"],
+            # the person's own record, so callers don't need the Person list alongside
+            "current_title": p.get("current_title"),
+            "headline": p.get("headline"),
+            "linkedin_url": p.get("linkedin_url"),
+            "location": p.get("location"),
+            "current_roles": current,
+            "past_roles": past,
+            "education": p.get("education") or [],
+            "skills": p.get("skills") or [],
             "as_of": day,
             "age": age,
             "nationality_signals": {

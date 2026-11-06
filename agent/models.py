@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Union
 from enum import Enum
 
 
@@ -56,22 +56,33 @@ class Confidence(str, Enum):
 
 
 class Citation(BaseModel):
+    # LLM/Crustdata often send numbers for text fields (e.g. funding 12000000); accept them as text
+    model_config = {"coerce_numbers_to_str": True}
+
     claim: str
     source: str
     confidence: Confidence
 
 
 class Founder(BaseModel):
+    # LLM/Crustdata often send numbers for text fields (e.g. funding 12000000); accept them as text
+    model_config = {"coerce_numbers_to_str": True}
+
     name: str
     current_title: Optional[str] = None
     education: Optional[str] = None
     past_companies: List[str] = []
     part_time_flag: bool = False
+    business_email: Optional[str] = None   # listed in the UI only; outreach goes to demo inboxes
+    email_status: Optional[str] = None
 
 
 class CompetitorRow(BaseModel):
+    # LLM/Crustdata often send numbers for text fields (e.g. funding 12000000); accept them as text
+    model_config = {"coerce_numbers_to_str": True}
+
     company: str
-    founded: Optional[str] = None
+    founded: Optional[Union[int, str]] = None  # frontend expects a year number
     focus: Optional[str] = None
     target_market: Optional[str] = None
     key_clients: Optional[str] = None
@@ -79,6 +90,9 @@ class CompetitorRow(BaseModel):
 
 
 class MemoSections(BaseModel):
+    # LLM/Crustdata often send numbers for text fields (e.g. funding 12000000); accept them as text
+    model_config = {"coerce_numbers_to_str": True}
+
     summary: str
     problem: str
     market: str
@@ -88,6 +102,9 @@ class MemoSections(BaseModel):
 
 
 class Signals(BaseModel):
+    # LLM/Crustdata often send numbers for text fields (e.g. funding 12000000); accept them as text
+    model_config = {"coerce_numbers_to_str": True}
+
     headcount_now: Optional[int] = None
     headcount_6m_ago: Optional[int] = None
     headcount_growth_rate: Optional[str] = None
@@ -102,6 +119,9 @@ class Decision(str, Enum):
 
 
 class CompanyResult(BaseModel):
+    # LLM/Crustdata often send numbers for text fields (e.g. funding 12000000); accept them as text
+    model_config = {"coerce_numbers_to_str": True}
+
     company_name: str
     domain: Optional[str] = None
     founded: Optional[int] = None
