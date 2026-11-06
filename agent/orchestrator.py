@@ -29,7 +29,7 @@ _key_index = 0
 
 def call_llm(prompt: str) -> str:
     global _key_index
-    models_to_try = ["gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash-lite"]
+    models_to_try = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
     for model_name in models_to_try:
         for attempt in range(3):  # 3 retries per model
             try:
@@ -54,30 +54,19 @@ def call_llm(prompt: str) -> str:
                     # model doesn't exist — skip to next model immediately
                     print(f"{model_name} not found, trying next model")
                     break
-                elif "ReadError" in err or "Connection reset" in err or "ConnectionError" in err:
-                    # transient network dropout — short wait and retry
-                    wait = (attempt + 1) * 3
-                    print(f"Network error on {model_name}, retrying in {wait}s")
-                    time.sleep(wait)
                 else:
                     raise
     raise Exception("All Gemini models unavailable")
 
 
 def parse_json_response(text: str) -> dict:
-    import re
-    text = text.strip()
     # Strip markdown code fences if present
+    text = text.strip()
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
             text = text[4:]
-    text = text.strip()
-    # Remove invalid control characters (tabs/newlines inside strings cause decode errors)
-    # Replace literal \r, \x00-\x1f (except \n, \t which json allows) only outside strings is complex,
-    # so we use a permissive approach: replace bare control chars that break json
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', ' ', text)
-    return json.loads(text)
+    return json.loads(text.strip())
 
 
 # --- Thesis parsing ---
@@ -326,20 +315,20 @@ async def run_pipeline(thesis: dict, job_id: str, jobs: dict):
                 companies[company_key] = {"company_data": company, "founders": []}
             companies[company_key]["founders"].append(fi)
 
-        # Cap to avoid processing hundreds of companies
-        MAX_COMPANIES = 12
-        company_list = list(companies.items())[:MAX_COMPANIES]
-        jobs[job_id]["progress"]["companies_found"] = len(company_list)
+        jobs[job_id]["progress"]["companies_found"] = len(companies)
 
-        processed_count = [0]
+        results = []
 
-        def _process_one_company(group):
+        for i, (_, group) in enumerate(companies.items()):
+            jobs[job_id]["progress"]["companies_processed"] = i
             company_data = group["company_data"]
             fi_list = group["founders"]
             company_name = company_data.get("name") or "Unknown"
             company_id = company_data.get("crustdata_company_id")
             domain = company_data.get("website") or ""
 
+            # Step 5: Extract signals from company data
+            jobs[job_id]["progress"]["stage"] = "signal_analysis"
             signals_raw = {
                 "headcount_now": company_data.get("headcount"),
                 "headcount_6m_ago": company_data.get("headcount_6m_ago"),
@@ -348,6 +337,7 @@ async def run_pipeline(thesis: dict, job_id: str, jobs: dict):
                 "hiring_departments": company_data.get("hiring_departments") or []
             }
 
+            # Step 6: Web search for market data + github/research details Crustdata doesn't have
             web_query = f"{company_name} {filters.get('sector', '')} startup"
             web_data = web_search(web_query)
             if domain:
@@ -361,10 +351,15 @@ async def run_pipeline(thesis: dict, job_id: str, jobs: dict):
                 if research.get("has_publications"):
                     web_data += " " + web_search(f"{name} research papers publications")
 
+            # Step 7: Generate memo
+            jobs[job_id]["progress"]["stage"] = "memo_generation"
             memo = generate_memo(company_data, fi_list, signals_raw, web_data)
+
+            # Step 8: Make decision
             founder_summary = build_founder_summary(fi_list)
             decision_data = make_decision(memo, signals_raw, founder_summary, thesis)
 
+            # Step 9: Exception checks
             missing_count = count_unavailable(company_data, fi_list)
             if missing_count >= EXCEPTION_THRESHOLD and not decision_data.get("exception_flag"):
                 decision_data["exception_flag"] = True
@@ -377,6 +372,7 @@ async def run_pipeline(thesis: dict, job_id: str, jobs: dict):
                     f"Possible part-time founder: {', '.join(f.get('name','') for f in part_time)}"
                 )
 
+            # Step 10: Draft outreach if meet
             outreach = None
             if decision_data.get("decision") == "meet" and fi_list:
                 primary = fi_list[0]
@@ -400,12 +396,14 @@ async def run_pipeline(thesis: dict, job_id: str, jobs: dict):
                             body=outreach
                         )
 
+            # Step 11: Set watcher if watch
             if crustdata_ready and company_id and decision_data.get("decision") == "watch":
                 watch_company(
                     company_id=company_id,
                     headcount_threshold=(signals_raw.get("headcount_now") or 0) + 5
                 )
 
+            # Step 12: Build citations and assemble result
             citations = build_citations(company_data, fi_list, web_data)
 
             founders = [
@@ -451,25 +449,7 @@ async def run_pipeline(thesis: dict, job_id: str, jobs: dict):
                 exception_reason=decision_data.get("exception_reason"),
                 outreach_email=outreach
             )
-            return result.model_dump()
-
-        import asyncio as _asyncio
-
-        sem = _asyncio.Semaphore(4)  # max 4 companies in parallel
-
-        async def _bounded(group):
-            async with sem:
-                result = await _asyncio.to_thread(_process_one_company, group)
-                processed_count[0] += 1
-                jobs[job_id]["progress"]["companies_processed"] = processed_count[0]
-                return result
-
-        jobs[job_id]["progress"]["stage"] = "memo_generation"
-        raw_results = await _asyncio.gather(
-            *[_bounded(group) for _, group in company_list],
-            return_exceptions=True
-        )
-        results = [r for r in raw_results if isinstance(r, dict)]
+            results.append(result.model_dump())
 
         jobs[job_id]["status"] = "done"
         jobs[job_id]["results"] = results
