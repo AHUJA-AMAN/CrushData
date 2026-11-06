@@ -57,7 +57,7 @@ function SignalsBar({ company }: { company: CompanyResult }) {
       </div>
       <div className="signal">
         <span className="signal-label">Growth (6 mo)</span>
-        <span className={`signal-value ${negative ? "neg" : "pos"}`}>{growth}</span>
+        <span className={`signal-value ${s.headcount_growth_rate == null ? "" : negative ? "neg" : "pos"}`}>{growth}</span>
       </div>
       <div className="signal">
         <span className="signal-label">Open roles</span>

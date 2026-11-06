@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional, List, Any, Union
 from enum import Enum
 
@@ -99,6 +99,22 @@ class MemoSections(BaseModel):
     product: List[str]
     competitive_landscape: List[CompetitorRow]
     x_factor: str
+
+    # Gemini sometimes answers a text section with a list of bullets (or product with one string).
+    # Reshape instead of failing the whole memo; the frontend renders "- " lines as bullets.
+    @field_validator("summary", "problem", "market", "x_factor", mode="before")
+    @classmethod
+    def _join_bullets(cls, v):
+        if isinstance(v, list):
+            return "\n".join(f"- {x}" for x in v if x not in (None, ""))
+        return "" if v is None else v
+
+    @field_validator("product", mode="before")
+    @classmethod
+    def _wrap_product(cls, v):
+        if v is None:
+            return []
+        return [v] if isinstance(v, str) else v
 
 
 class Signals(BaseModel):

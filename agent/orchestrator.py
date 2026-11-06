@@ -603,7 +603,7 @@ def _analyze_company(job: dict, group: dict, profile: dict | None, filters: dict
             summary=memo.get("summary", ""),
             problem=memo.get("problem", ""),
             market=memo.get("market", ""),
-            product=memo.get("product", []) if isinstance(memo.get("product"), list) else [str(memo.get("product"))],
+            product=memo.get("product", []),
             competitive_landscape=comp_landscape,
             x_factor=memo.get("x_factor", "")
         ),
