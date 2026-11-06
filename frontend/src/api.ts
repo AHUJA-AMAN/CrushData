@@ -11,7 +11,8 @@ const delay = <T,>(value: T, ms = 300) => new Promise<T>((r) => setTimeout(() =>
 
 async function http<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
+    // ngrok's free tunnel shows an HTML warning page to browsers unless this header is sent
+    headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
     ...init,
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
