@@ -1,6 +1,6 @@
 import uuid
 import os
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -9,7 +9,10 @@ from agent.models import Thesis
 
 class RunRequest(BaseModel):
     thesis: Thesis
-from agent.orchestrator import run_pipeline, run_backtest_pipeline
+class SelectRequest(BaseModel):
+    company_ids: list[str]
+
+from agent.orchestrator import run_pipeline, run_backtest_pipeline, prepare_memos
 
 load_dotenv()
 
@@ -59,7 +62,8 @@ async def status(job_id: str):
     return {
         "job_id": job_id,
         "status": job["status"],
-        "progress": job["progress"]
+        "progress": job["progress"],
+        "error": job.get("error"),
     }
 
 
@@ -68,11 +72,41 @@ async def results(job_id: str):
     if job_id not in jobs:
         return {"error": "job not found"}
     job = jobs[job_id]
+    # Results grow while memos are written: the frontend polls this and shows each memo as it lands
     return {
         "job_id": job_id,
         "status": job["status"],
-        "results": job.get("results", [])
+        "progress": job["progress"],
+        "candidates": job.get("candidates") or [],
+        "results": list(job.get("results") or []),
     }
+
+
+@app.post("/select/{job_id}")
+def select(job_id: str, request: SelectRequest, background_tasks: BackgroundTasks):
+    """Start memos for the companies the user picked (from /results candidates)."""
+    job = jobs.get(job_id)
+    if not job or "_ctx" not in job:
+        raise HTTPException(404, "job not found or discovery not finished")
+    if job["status"] == "running" or job.get("_busy"):
+        raise HTTPException(409, "memos are still being prepared or stopping for this job, try again shortly")
+    if not request.company_ids:
+        raise HTTPException(400, "pick at least one company")
+    job.update(status="running", cancel=False, error=None)
+    background_tasks.add_task(prepare_memos, job_id, jobs, request.company_ids)
+    return {"job_id": job_id, "selected": len(request.company_ids)}
+
+
+@app.post("/cancel/{job_id}")
+def cancel(job_id: str):
+    """Stop a job. Takes effect at the next step; a model call already in flight finishes first."""
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    job["cancel"] = True
+    if job["status"] in ("running", "awaiting_selection"):
+        job["status"] = "cancelled"
+    return {"job_id": job_id, "status": job["status"]}
 
 
 class BacktestRequest(BaseModel):

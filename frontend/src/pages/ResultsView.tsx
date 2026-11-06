@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { getResults } from "../api";
+import { KillButton } from "../components/bits";
 import ResultCard from "../components/ResultCard";
 import { getJobId } from "../jobStore";
-import type { CompanyResult, Decision } from "../types";
+import type { CompanyResult, Decision, JobProgress, JobState } from "../types";
 
 type Filter = "all" | Decision;
 const FILTERS: { value: Filter; label: string }[] = [
@@ -18,12 +19,35 @@ export default function ResultsView() {
   const [results, setResults] = useState<CompanyResult[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>("all");
+  const [jobState, setJobState] = useState<JobState | null>(null);
+  const [progress, setProgress] = useState<JobProgress | null>(null);
 
+  // Memos land one by one: keep polling while the job is running, show each as soon as it arrives.
   useEffect(() => {
     if (!jobId) return;
-    getResults(jobId)
-      .then((r) => setResults(r.results))
-      .catch((e) => setError(e instanceof Error ? e.message : "Could not load results."));
+    let stop = false;
+    let timer: number | undefined;
+    const tick = async () => {
+      let again = true;
+      try {
+        const r = await getResults(jobId);
+        if (stop) return;
+        setResults(r.results ?? []);
+        setJobState(r.status);
+        setProgress(r.progress ?? null);
+        setError(null);
+        again = r.status === "running";
+      } catch (e) {
+        if (stop) return;
+        setError(e instanceof Error ? e.message : "Could not load results.");
+      }
+      if (again) timer = window.setTimeout(tick, 2500);
+    };
+    tick();
+    return () => {
+      stop = true;
+      if (timer) window.clearTimeout(timer);
+    };
   }, [jobId]);
 
   const counts = useMemo(() => {
@@ -54,6 +78,25 @@ export default function ResultsView() {
       <h1>Results</h1>
       <p className="muted lead">One memo per company, with every claim cited to its source.</p>
 
+      {jobState === "running" && (
+        <div className="progress-card live">
+          <div className="row">
+            <strong>
+              <span className="spinner" aria-hidden="true" /> Preparing memos: {progress?.companies_processed ?? 0} of{" "}
+              {progress?.companies_found ?? 0} done
+            </strong>
+            <KillButton jobId={jobId} onKilled={() => setJobState("cancelled")} />
+          </div>
+          <p className="muted small">Each memo shows up below as soon as it's ready.</p>
+        </div>
+      )}
+      {jobState === "awaiting_selection" && (
+        <p className="muted">
+          Discovery is done. <Link to="/status">Pick the companies</Link> you want memos for.
+        </p>
+      )}
+      {jobState === "cancelled" && <p className="muted">Run stopped. Memos prepared before the stop are below.</p>}
+
       {error && (
         <p className="error" role="alert">
           {error}
@@ -79,11 +122,11 @@ export default function ResultsView() {
           </div>
 
           {shown.length === 0 ? (
-            <p className="muted">No companies match this filter.</p>
+            <p className="muted">{jobState === "running" ? "The first memo is on its way..." : "No companies match this filter."}</p>
           ) : (
             <div className="results">
               {shown.map((c) => (
-                <ResultCard key={c.domain} company={c} />
+                <ResultCard key={c.company_name} company={c} />
               ))}
             </div>
           )}

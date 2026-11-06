@@ -33,7 +33,19 @@ export function getStatus(jobId: string): Promise<JobStatus> {
   return USE_MOCK ? delay(mockStatus(jobId), 150) : http(`/status/${jobId}`);
 }
 
-// GET /results/{job_id}
+// GET /results/{job_id}  (also carries the discovered candidates; results grow while memos are written)
 export function getResults(jobId: string): Promise<JobResults> {
   return USE_MOCK ? delay({ ...mockResults, job_id: jobId }) : http(`/results/${jobId}`);
+}
+
+// POST /select/{job_id}  start memos for the picked companies
+export function selectCompanies(jobId: string, companyIds: string[]): Promise<unknown> {
+  if (USE_MOCK) return delay({ job_id: jobId });
+  return http(`/select/${jobId}`, { method: "POST", body: JSON.stringify({ company_ids: companyIds }) });
+}
+
+// POST /cancel/{job_id}  stop the run
+export function cancelRun(jobId: string): Promise<unknown> {
+  if (USE_MOCK) return delay({ job_id: jobId });
+  return http(`/cancel/${jobId}`, { method: "POST" });
 }

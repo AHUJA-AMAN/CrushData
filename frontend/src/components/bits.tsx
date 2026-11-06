@@ -1,4 +1,5 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
+import { cancelRun } from "../api";
 import type { CitationConfidence, Decision } from "../types";
 
 export function DecisionBadge({ decision }: { decision: Decision }) {
@@ -54,4 +55,23 @@ export function RichText({ text }: { text: string }) {
   }
   flush();
   return <div className="rich">{blocks}</div>;
+}
+
+/** Stops the backend job. Takes effect at the next step; a model call already in flight finishes first. */
+export function KillButton({ jobId, onKilled }: { jobId: string; onKilled?: () => void }) {
+  const [state, setState] = useState<"idle" | "stopping" | "error">("idle");
+  async function kill() {
+    setState("stopping");
+    try {
+      await cancelRun(jobId);
+      onKilled?.();
+    } catch {
+      setState("error");
+    }
+  }
+  return (
+    <button type="button" className="danger" onClick={kill} disabled={state === "stopping"}>
+      {state === "stopping" ? "Stopping..." : state === "error" ? "Retry stop" : "Kill task"}
+    </button>
+  );
 }

@@ -73,6 +73,8 @@ class Founder(BaseModel):
     education: Optional[str] = None
     past_companies: List[str] = []
     part_time_flag: bool = False
+    business_email: Optional[str] = None   # listed in the UI only; outreach goes to demo inboxes
+    email_status: Optional[str] = None
 
 
 class CompetitorRow(BaseModel):

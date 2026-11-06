@@ -1,8 +1,8 @@
 // Types mirror the backend contract (POST /run, GET /status/{job_id}, GET /results/{job_id}).
 
 export type Decision = "meet" | "pass" | "watch";
-export type JobState = "running" | "done" | "failed";
-export type PipelineStage = "discovery" | "verification" | "signal_analysis" | "memo_generation" | "done";
+export type JobState = "running" | "awaiting_selection" | "done" | "failed" | "cancelled";
+export type PipelineStage = "discovery" | "verification" | "signal_analysis" | "selection" | "memo_generation" | "done";
 export type CitationConfidence = "verified" | "web" | "inferred" | "unavailable";
 
 // ---------- POST /run ----------
@@ -62,6 +62,7 @@ export interface JobStatus {
   job_id: string;
   status: JobState;
   progress: JobProgress;
+  error?: string | null;
 }
 
 // ---------- GET /results/{job_id} ----------
@@ -72,6 +73,8 @@ export interface Founder {
   education: string;
   past_companies: string[];
   part_time_flag: boolean;
+  business_email?: string | null; // listed only, never emailed
+  email_status?: string | null;
 }
 
 export interface CompetitorRow {
@@ -124,8 +127,24 @@ export interface CompanyResult {
   outreach_email: string | null;
 }
 
+// A company found by discovery, before any memo is written. The user picks which ones get a memo.
+export interface Candidate {
+  id: string;
+  company_name: string;
+  domain: string | null;
+  location: string | null;
+  founded: number | null;
+  stage: string | null;
+  total_funding: string | null;
+  headcount: number | null;
+  description: string | null;
+  founders: { name: string; current_title: string | null }[];
+}
+
 export interface JobResults {
   job_id: string;
   status: JobState;
+  progress?: JobProgress;
+  candidates?: Candidate[];
   results: CompanyResult[];
 }

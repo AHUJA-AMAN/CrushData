@@ -26,16 +26,19 @@ API_KEYS = [k for k in [
 ] if k]
 
 _key_index = 0
+# ponytail: a model that times out or 404s is skipped until the server restarts
+_dead_models: set = set()
+LLM_TIMEOUT_MS = 45000
 
 def call_llm(prompt: str) -> str:
     global _key_index
     if not API_KEYS:
         raise RuntimeError("No Gemini API key set: add GEMINI_API_KEY to .env")
-    models_to_try = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
-    for model_name in models_to_try:
+    models_to_try = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"]
+    for model_name in [m for m in models_to_try if m not in _dead_models]:
         for attempt in range(3):  # 3 retries per model
             try:
-                client = genai.Client(api_key=API_KEYS[_key_index])
+                client = genai.Client(api_key=API_KEYS[_key_index], http_options={"timeout": LLM_TIMEOUT_MS})
                 response = client.models.generate_content(
                     model=model_name,
                     contents=prompt
@@ -43,18 +46,22 @@ def call_llm(prompt: str) -> str:
                 return response.text
             except Exception as e:
                 err = str(e)
+                if "504" in err or "DEADLINE" in err or "timed out" in err.lower() or "timeout" in type(e).__name__.lower():
+                    print(f"{model_name} timed out, skipping it from now on", flush=True)
+                    _dead_models.add(model_name)
+                    break
                 if "429" in err or "quota" in err.lower():
                     # rotate key and retry
                     _key_index = (_key_index + 1) % len(API_KEYS)
                     time.sleep(2)
                 elif "503" in err or "UNAVAILABLE" in err or "overload" in err.lower():
-                    # server overloaded — wait longer then try next model
-                    wait = (attempt + 1) * 5
-                    print(f"{model_name} unavailable, waiting {wait}s (attempt {attempt+1})")
-                    time.sleep(wait)
+                    # overloaded: move to the next model now instead of waiting on this one
+                    print(f"{model_name} unavailable (503), trying next model", flush=True)
+                    break
                 elif "404" in err or "NOT_FOUND" in err:
                     # model doesn't exist — skip to next model immediately
-                    print(f"{model_name} not found, trying next model")
+                    print(f"{model_name} not found, trying next model", flush=True)
+                    _dead_models.add(model_name)
                     break
                 else:
                     raise
@@ -354,176 +361,258 @@ def _error_result(company_name: str, error: Exception) -> dict:
 
 
 # --- Main pipeline ---
+# Two phases so the user picks which companies get a memo:
+#   run_pipeline:  thesis -> founders -> companies -> job["candidates"], status "awaiting_selection"
+#   prepare_memos: memo + decision for each picked company, appended to job["results"] as soon as it's done
 # Plain `def` on purpose: every call in here blocks (Crustdata, Gemini, SMTP, sleeps). FastAPI runs
 # sync background tasks in a worker thread, so /run returns at once and /status keeps answering.
 # As `async def` it ran on the event loop and froze the whole server until the job finished.
 
+class Cancelled(Exception):
+    pass
+
+
+def _check_cancel(job: dict):
+    # ponytail: checked between steps; a Gemini/Crustdata call already in flight finishes first
+    if job.get("cancel"):
+        raise Cancelled()
+
+
+def _candidate(key: str, group: dict, company_data: dict) -> dict:
+    fi_list = group["founders"]
+    return {
+        "id": key,
+        "company_name": company_data.get("name") or (fi_list[0].get("name", "Unknown") + " (company not on Crustdata)"),
+        "domain": company_data.get("website"),
+        "location": company_data.get("location"),
+        "founded": company_data.get("founded_year"),
+        "stage": company_data.get("stage"),
+        "total_funding": _fmt_usd(company_data.get("total_funding")),
+        "headcount": company_data.get("headcount"),
+        "description": (company_data.get("description") or "")[:240] or None,
+        "founders": [{"name": fi.get("name") or "Unknown", "current_title": fi.get("current_title")} for fi in fi_list],
+    }
+
+
 def run_pipeline(thesis: dict, job_id: str, jobs: dict):
+    job = jobs[job_id]
     try:
-        try:
-            from crustdata.client import (
-                search_founders, founder_insights, enrich_companies, headcount_signals,
-                get_hiring, watch_company, find_email, outreach_recipient
-            )
-            crustdata_ready = True
-        except ImportError:
-            crustdata_ready = False
+        from crustdata.client import search_founders, founder_insights, enrich_companies
 
         # Step 1: Parse thesis into search_founders parameters
-        jobs[job_id]["progress"]["stage"] = "discovery"
+        job["progress"]["stage"] = "discovery"
         filters = parse_thesis(thesis)
+        _check_cancel(job)
 
         # Step 2: Search founders
-        people = []
-        if crustdata_ready:
-            people = search_founders(
-                country=filters.get("geography"),
-                schools=filters.get("schools", []),
-                fields_of_study=filters.get("fields_of_study", []),
-                past_companies=filters.get("past_companies", []),
-                past_titles=filters.get("past_titles", []),
-                expertise_keywords=filters.get("expertise_keywords", [])
-            ) or []
-
+        people = search_founders(
+            country=filters.get("geography"),
+            schools=filters.get("schools", []),
+            fields_of_study=filters.get("fields_of_study", []),
+            past_companies=filters.get("past_companies", []),
+            past_titles=filters.get("past_titles", []),
+            expertise_keywords=filters.get("expertise_keywords", [])
+        ) or []
+        _check_cancel(job)
         if not people:
-            jobs[job_id]["status"] = "done"
-            jobs[job_id]["results"] = []
+            job.update(status="done", results=[], candidates=[])
+            job["progress"]["stage"] = "done"
             return
 
         # Step 3: Founder insights (10-15 credits per founder first time, cached after)
-        jobs[job_id]["progress"]["stage"] = "verification"
+        job["progress"]["stage"] = "verification"
         insights = founder_insights(people) or {}
+        _check_cancel(job)
 
         # Step 4: Group founders by company, then load full company profiles (cached: founder_insights already fetched them)
-        companies = _group_by_company(insights)
-        company_ids = [k for k in companies if isinstance(k, int)]
+        groups = {str(k): g for k, g in _group_by_company(insights).items()}
+        company_ids = [g["company"].get("crustdata_company_id") for g in groups.values()]
+        company_ids = [c for c in company_ids if isinstance(c, int)]
         profiles = (enrich_companies(company_ids) or {}) if company_ids else {}
-        jobs[job_id]["progress"]["companies_found"] = len(companies)
+        _check_cancel(job)
 
-        results = []
-        for i, group in enumerate(companies.values()):
-            jobs[job_id]["progress"]["companies_processed"] = i
-            fi_list = group["founders"]
-            company_id = group["company"].get("crustdata_company_id")
-            profile = profiles.get(company_id) if company_id else None
-            company_data = build_company_data(group["company"], profile)
-            company_name = company_data.get("name") or (fi_list[0].get("name", "Unknown") + " (company not on Crustdata)")
-            try:
-                # Step 5: Signals from the headcount history and job postings
-                jobs[job_id]["progress"]["stage"] = "signal_analysis"
-                hc = headcount_signals(profile["headcount_timeseries"]) if profile else None
-                hiring = get_hiring(company_id) if company_id else None
-                signals_raw = build_signals(company_data, hc, hiring)
+        # Step 5: Show the companies and wait for the user to pick which ones get a memo
+        candidates = []
+        for key, g in groups.items():
+            cid = g["company"].get("crustdata_company_id")
+            candidates.append(_candidate(key, g, build_company_data(g["company"], profiles.get(cid) if cid else None)))
+        job["_ctx"] = {"thesis": thesis, "filters": filters, "groups": groups, "profiles": profiles, "done": set()}
+        job["candidates"] = candidates
+        job["results"] = []
+        job["progress"].update(stage="selection", companies_found=len(candidates), companies_processed=0)
+        job["status"] = "awaiting_selection"
 
-                # Step 6: Web search for market data + github/research details Crustdata doesn't have
-                domain = company_data.get("domain") or ""
-                web_data = web_search(f"{company_name} {filters.get('sector', '')} startup")
-                if domain:
-                    web_data += " " + web_search(f"site:{domain} product")
-                for fi in fi_list:
-                    name = fi.get("name", "")
-                    if (fi.get("github") or {}).get("has_github"):
-                        web_data += " " + web_search(f"{name} github repositories languages")
-                    if (fi.get("research") or {}).get("has_publications"):
-                        web_data += " " + web_search(f"{name} research papers publications")
-
-                # Step 7: Memo (drop the long per-role lists; the memo prompt reads the derived fields)
-                jobs[job_id]["progress"]["stage"] = "memo_generation"
-                memo_founders = [{k: v for k, v in fi.items() if k not in ("current_roles", "source")} for fi in fi_list]
-                memo = generate_memo(company_data, memo_founders, signals_raw, web_data)
-
-                # Step 8: Decision
-                decision_data = make_decision(memo, signals_raw, build_founder_summary(fi_list), thesis)
-                decision = normalize_decision(decision_data.get("decision"))
-
-                # Step 9: Exception checks
-                missing_count = count_unavailable(company_data, fi_list)
-                if missing_count >= EXCEPTION_THRESHOLD and not decision_data.get("exception_flag"):
-                    decision_data["exception_flag"] = True
-                    decision_data["exception_reason"] = f"{missing_count} key data fields unavailable"
-                part_time = [fi for fi in fi_list if fi.get("possible_part_time_founder")]
-                if part_time and not decision_data.get("exception_flag"):
-                    decision_data["exception_flag"] = True
-                    decision_data["exception_reason"] = f"Possible part-time founder: {', '.join(f.get('name', '') for f in part_time)}"
-
-                # Step 10: Draft outreach if meet (always sent to a team demo inbox, never the founder)
-                outreach = None
-                if decision == Decision.meet and fi_list:
-                    primary = fi_list[0]
-                    outreach = draft_outreach(
-                        founder_name=primary.get("name", "Founder"),
-                        founder_background=f"{primary.get('current_title') or 'Founder'} — previously at {', '.join(past_company_names(primary, 2)) or 'n/a'}",
-                        company_name=company_name,
-                        company_summary=memo.get("summary", ""),
-                        decision_reasoning=decision_data.get("reasoning", "")
-                    )
-                    if outreach and primary.get("linkedin_url"):
-                        email = find_email(primary["linkedin_url"], company_id)
-                        real_email = email.get("email") if email else None
-                        recipient = outreach_recipient(primary.get("crustdata_person_id") or primary.get("name"), real_email)
-                        if recipient:
-                            send_outreach_email(
-                                send_to=recipient["send_to"],
-                                intended_for=real_email or f"{primary.get('name', 'founder')} (no email on file)",
-                                subject=f"Quick note on {company_name}",
-                                body=outreach
-                            )
-
-                # Step 11: Watcher if watch: fire on new round / new founder or CXO / ~20% headcount growth
-                if company_id and decision == Decision.watch:
-                    now = signals_raw.get("headcount_now")
-                    watch_company(company_id, headcount_threshold=(now + max(5, round(now * 0.2))) if now else None)
-
-                # Step 12: Citations and result
-                founders = [
-                    Founder(
-                        name=fi.get("name") or "Unknown",
-                        current_title=fi.get("current_title"),
-                        education=education_text(fi.get("education")),
-                        past_companies=past_company_names(fi),
-                        part_time_flag=bool(fi.get("possible_part_time_founder")),
-                    )
-                    for fi in fi_list
-                ]
-                comp_landscape = [CompetitorRow(**c) for c in memo.get("competitive_landscape", []) if isinstance(c, dict) and c.get("company")]
-                result = CompanyResult(
-                    company_name=company_name,
-                    domain=company_data.get("website"),
-                    founded=company_data.get("founded_year"),
-                    location=company_data.get("location"),
-                    stage=company_data.get("stage") or thesis.get("stage"),
-                    total_funding=_fmt_usd(company_data.get("total_funding")),
-                    decision=decision,
-                    confidence=str(decision_data.get("confidence", "low")),
-                    founders=founders,
-                    memo_sections=MemoSections(
-                        summary=memo.get("summary", ""),
-                        problem=memo.get("problem", ""),
-                        market=memo.get("market", ""),
-                        product=memo.get("product", []) if isinstance(memo.get("product"), list) else [str(memo.get("product"))],
-                        competitive_landscape=comp_landscape,
-                        x_factor=memo.get("x_factor", "")
-                    ),
-                    signals=Signals(**{k: v for k, v in signals_raw.items() if k in Signals.model_fields}),
-                    citations=build_citations(company_data, fi_list, web_data),
-                    exception_flag=bool(decision_data.get("exception_flag", False)),
-                    exception_reason=decision_data.get("exception_reason"),
-                    outreach_email=outreach
-                )
-                results.append(result.model_dump())
-            except Exception as e:
-                print(f"[{job_id}] {company_name} failed: {e}")
-                results.append(_error_result(company_name, e))
-
-        jobs[job_id]["progress"]["companies_processed"] = len(companies)
-        jobs[job_id]["progress"]["stage"] = "done"
-        jobs[job_id]["status"] = "done"
-        jobs[job_id]["results"] = results
-
+    except Cancelled:
+        job["status"] = "cancelled"
     except Exception as e:
-        jobs[job_id]["status"] = "failed"
-        jobs[job_id]["error"] = str(e)
+        job["status"] = "failed"
+        job["error"] = str(e)
         raise
+
+
+def prepare_memos(job_id: str, jobs: dict, company_ids: list):
+    """Memo + decision for each picked company; each result is visible in /results as soon as it's done."""
+    job = jobs[job_id]
+    ctx = job["_ctx"]
+    todo = [c for c in company_ids if c in ctx["groups"] and c not in ctx["done"]]
+    job["progress"].update(stage="memo_generation", companies_found=len(todo), companies_processed=0)
+    job["_busy"] = True
+    try:
+        for i, key in enumerate(todo):
+            _check_cancel(job)
+            group = ctx["groups"][key]
+            cid = group["company"].get("crustdata_company_id")
+            try:
+                result = _analyze_company(job, group, ctx["profiles"].get(cid) if cid else None, ctx["filters"], ctx["thesis"])
+            except Cancelled:
+                raise
+            except Exception as e:
+                name = _candidate(key, group, build_company_data(group["company"], None))["company_name"]
+                print(f"[{job_id}] {name} failed: {e}", flush=True)
+                result = _error_result(name, e)
+            result["candidate_id"] = key
+            job["results"].append(result)
+            ctx["done"].add(key)
+            job["progress"]["companies_processed"] = i + 1
+        job["progress"]["stage"] = "done"
+        job["status"] = "done"
+    except Cancelled:
+        job["status"] = "cancelled"
+    except Exception as e:
+        job["status"] = "failed"
+        job["error"] = str(e)
+        raise
+    finally:
+        job["_busy"] = False
+
+
+def _analyze_company(job: dict, group: dict, profile: dict | None, filters: dict, thesis: dict) -> dict:
+    from crustdata.client import headcount_signals, get_hiring, watch_company, find_email, outreach_recipient
+
+    fi_list = group["founders"]
+    company_id = group["company"].get("crustdata_company_id")
+    company_data = build_company_data(group["company"], profile)
+    company_name = company_data.get("name") or (fi_list[0].get("name", "Unknown") + " (company not on Crustdata)")
+
+    # Signals from the headcount history and job postings
+    hc = headcount_signals(profile["headcount_timeseries"]) if profile else None
+    hiring = get_hiring(company_id) if company_id else None
+    signals_raw = build_signals(company_data, hc, hiring)
+    _check_cancel(job)
+
+    # Business emails, listed in the UI only. Outreach still goes to a team demo inbox, never these.
+    emails = {}
+    for fi in fi_list:
+        if fi.get("linkedin_url"):
+            emails[id(fi)] = find_email(fi["linkedin_url"], company_id)
+    _check_cancel(job)
+
+    # Web search for market data + github/research details Crustdata doesn't have
+    domain = company_data.get("domain") or ""
+    web_data = web_search(f"{company_name} {filters.get('sector', '')} startup")
+    if domain:
+        web_data += " " + web_search(f"site:{domain} product")
+    for fi in fi_list:
+        name = fi.get("name", "")
+        if (fi.get("github") or {}).get("has_github"):
+            web_data += " " + web_search(f"{name} github repositories languages")
+        if (fi.get("research") or {}).get("has_publications"):
+            web_data += " " + web_search(f"{name} research papers publications")
+    _check_cancel(job)
+
+    # Memo (drop the long per-role lists; the memo prompt reads the derived fields)
+    memo_founders = [{k: v for k, v in fi.items() if k not in ("current_roles", "source")} for fi in fi_list]
+    memo = generate_memo(company_data, memo_founders, signals_raw, web_data)
+    _check_cancel(job)
+
+    # Decision
+    decision_data = make_decision(memo, signals_raw, build_founder_summary(fi_list), thesis)
+    decision = normalize_decision(decision_data.get("decision"))
+    _check_cancel(job)
+
+    # Exception checks
+    missing_count = count_unavailable(company_data, fi_list)
+    if missing_count >= EXCEPTION_THRESHOLD and not decision_data.get("exception_flag"):
+        decision_data["exception_flag"] = True
+        decision_data["exception_reason"] = f"{missing_count} key data fields unavailable"
+    part_time = [fi for fi in fi_list if fi.get("possible_part_time_founder")]
+    if part_time and not decision_data.get("exception_flag"):
+        decision_data["exception_flag"] = True
+        decision_data["exception_reason"] = f"Possible part-time founder: {', '.join(f.get('name', '') for f in part_time)}"
+
+    # Draft outreach if meet (always sent to a team demo inbox, never the founder)
+    outreach = None
+    if decision == Decision.meet and fi_list:
+        primary = fi_list[0]
+        outreach = draft_outreach(
+            founder_name=primary.get("name", "Founder"),
+            founder_background=f"{primary.get('current_title') or 'Founder'} — previously at {', '.join(past_company_names(primary, 2)) or 'n/a'}",
+            company_name=company_name,
+            company_summary=memo.get("summary", ""),
+            decision_reasoning=decision_data.get("reasoning", "")
+        )
+        _check_cancel(job)
+        if outreach and primary.get("linkedin_url"):
+            real_email = (emails.get(id(primary)) or {}).get("email")
+            recipient = outreach_recipient(primary.get("crustdata_person_id") or primary.get("name"), real_email)
+            if recipient:
+                send_outreach_email(
+                    send_to=recipient["send_to"],
+                    intended_for=real_email or f"{primary.get('name', 'founder')} (no email on file)",
+                    subject=f"Quick note on {company_name}",
+                    body=outreach
+                )
+
+    # Watcher if watch: fire on new round / new founder or CXO / ~20% headcount growth
+    if company_id and decision == Decision.watch:
+        now = signals_raw.get("headcount_now")
+        watch_company(company_id, headcount_threshold=(now + max(5, round(now * 0.2))) if now else None)
+
+    # Citations and result
+    def email_fields(fi):
+        if not fi.get("linkedin_url"):
+            return {"business_email": None, "email_status": "no LinkedIn on file"}
+        found = emails.get(id(fi))
+        if not found:
+            return {"business_email": None, "email_status": "lookup failed"}
+        return {"business_email": found.get("email"), "email_status": found.get("status") if found.get("email") else "not on file"}
+
+    founders = [
+        Founder(
+            name=fi.get("name") or "Unknown",
+            current_title=fi.get("current_title"),
+            education=education_text(fi.get("education")),
+            past_companies=past_company_names(fi),
+            part_time_flag=bool(fi.get("possible_part_time_founder")),
+            **email_fields(fi),
+        )
+        for fi in fi_list
+    ]
+    comp_landscape = [CompetitorRow(**c) for c in memo.get("competitive_landscape", []) if isinstance(c, dict) and c.get("company")]
+    return CompanyResult(
+        company_name=company_name,
+        domain=company_data.get("website"),
+        founded=company_data.get("founded_year"),
+        location=company_data.get("location"),
+        stage=company_data.get("stage") or thesis.get("stage"),
+        total_funding=_fmt_usd(company_data.get("total_funding")),
+        decision=decision,
+        confidence=str(decision_data.get("confidence", "low")),
+        founders=founders,
+        memo_sections=MemoSections(
+            summary=memo.get("summary", ""),
+            problem=memo.get("problem", ""),
+            market=memo.get("market", ""),
+            product=memo.get("product", []) if isinstance(memo.get("product"), list) else [str(memo.get("product"))],
+            competitive_landscape=comp_landscape,
+            x_factor=memo.get("x_factor", "")
+        ),
+        signals=Signals(**{k: v for k, v in signals_raw.items() if k in Signals.model_fields}),
+        citations=build_citations(company_data, fi_list, web_data),
+        exception_flag=bool(decision_data.get("exception_flag", False)),
+        exception_reason=decision_data.get("exception_reason"),
+        outreach_email=outreach
+    ).model_dump()
 
 
 def run_backtest_pipeline(thesis: dict, job_id: str, jobs: dict, as_of_date: str):
@@ -569,6 +658,9 @@ def run_backtest_pipeline(thesis: dict, job_id: str, jobs: dict, as_of_date: str
 
         results = []
         for i, group in enumerate(companies.values()):
+            if jobs[job_id].get("cancel"):
+                jobs[job_id]["status"] = "cancelled"
+                return
             jobs[job_id]["progress"]["companies_processed"] = i
             jobs[job_id]["progress"]["stage"] = "memo_generation"
             fi_list = group["founders"]
